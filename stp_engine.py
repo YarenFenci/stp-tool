@@ -1,21 +1,29 @@
 """
-STP Engine — platform-aware, scenario-based, deterministic.
-Same CSV -> same output every time.
+STP Engine — deterministic, scenario-based priority assignment.
 
-Key rules:
-1. Platform detection: Android / iOS / Both (from text signals)
-2. UI edge cases -> forced Low (visual glitches, alignment, cosmetic issues)
-3. Device-specific signals -> informational only (flag shown, priority NOT changed)
-4. Priority decision tree: Gating > High > Medium > Low via keyword matching
+Priority logic (in order):
+  1. Gating  — app/feature completely broken, crash, freeze, cannot perform core action
+  2. High    — core feature works but has a meaningful defect affecting user flow
+  3. Medium  — secondary UX, non-blocking issues, minor functional gaps
+  4. Low     — cosmetic, text, icon, layout issues with no functional impact
+
+Device/OS scope:
+  - Detected separately and stored in "Device Scope" column
+  - Priority is ADJUSTED based on scope:
+      * Generic (no device/OS signal) → priority as-is
+      * OS-specific (e.g. iOS 15, Android 12) → Gating→High, High→Medium (not Low)
+      * Device-specific (e.g. Redmi 10, Samsung A13) → same as OS-specific
+      * EXCEPTION: crash/ANR/freeze on a specific device/OS still stays Gating
+        because a crash is never acceptable regardless of scope
 """
 
 import re
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import pandas as pd
 
 # ─────────────────────────────────────────────────────────────
-# Required columns — exact match, no fallback
+# Required columns
 # ─────────────────────────────────────────────────────────────
 REQUIRED_COLS = [
     "Issue key",
@@ -25,202 +33,254 @@ REQUIRED_COLS = [
     "Custom field (Scenario Expected Result)",
 ]
 
-PRIORITY_ORDER = ["Gating", "High", "Medium", "Low"]
+PRIORITY_ORDER     = ["Gating", "High", "Medium", "Low"]
+PRIORITY_RANK      = {"Gating": 0, "High": 1, "Medium": 2, "Low": 3}
+PRIORITY_FROM_RANK = {0: "Gating", 1: "High", 2: "Medium", 3: "Low"}
 
 REASON_MAP = {
-    "Gating": "Core functionality broken",
-    "High":   "Core feature validation",
-    "Medium": "UX / secondary behaviour",
-    "Low":    "Edge / UI validation",
+    "Gating": "Core functionality broken — blocks user",
+    "High":   "Core feature defect — affects main user flow",
+    "Medium": "Secondary UX issue — non-blocking",
+    "Low":    "Cosmetic / minor edge — no functional impact",
 }
 
 # ─────────────────────────────────────────────────────────────
-# Platform detection signals
+# GATING terms — app/feature completely non-functional
 # ─────────────────────────────────────────────────────────────
-ANDROID_SIGNALS = [
-    "android", "google play", "play store",
-    "apk", "aab", "back button", "back key",
-    "notification drawer", "status bar", "navigation bar",
-    "samsung", "xiaomi", "huawei", "oppo", "vivo", "realme",
-    "redmi", "poco", "oneplus", "motorola", "nokia android",
-    "tecno", "infinix", "itel",
-    "api level", "anr", "dalvik",
+GATING_TERMS = [
+    # Hard crashes
+    "crash", "crashes", "force close", "force-close",
+    "freeze", "frozen", "hang", "hangs", "hung",
+    "anr", "not responding", "app not responding",
+    "black screen", "white screen", "blank screen",
+    # Cannot open / launch
+    "cannot open", "can't open", "not open", "fails to open",
+    "app not launching", "does not launch", "won't launch",
+    "splash screen stuck", "stuck on splash",
+    # Cannot send / receive (messaging)
+    "cannot send", "can't send", "message not sent", "fails to send",
+    "cannot receive", "can't receive", "not received",
+    "messages not delivered", "message failed to send",
+    "chat not loading", "cannot open chat",
+    # Data loss
+    "data loss", "messages missing", "message lost", "messages lost",
+    # Auth completely broken
+    "cannot login", "login fail", "login error", "login failed",
+    "sign in fail", "sign in failed", "cannot sign in",
+    "cannot register", "registration failed",
+    "otp not received", "otp not working",
+    # Call completely broken
+    "cannot start call", "call not started", "cannot call", "call failed",
+    "call not connecting", "cannot join call",
+    "no audio", "no video", "mic not working", "camera not working",
+    # Other core broken
+    "cannot upload", "upload failed", "upload not working",
+    "cannot post", "post failed",
+    "cannot open channel", "channel not loading",
+    "status not loading", "cannot view status",
+    "cannot save", "save failed", "settings not saved",
+    "cannot logout", "logout failed",
+    "feed not loading", "content not loading",
+    "not working", "does not work",
 ]
 
-IOS_SIGNALS = [
-    "ios", "iphone", "ipad", "ipod",
-    "app store", "testflight",
-    "swipe back", "swipe from edge",
-    "face id", "touch id",
-    "home indicator", "safe area", "notch",
-    "haptic", "3d touch", "force touch",
-    "siri", "airdrop", "imessage",
-    "xcode", "swift", "objective-c",
-]
-
-OS_VERSION_PATTERNS = [
-    r"android\s*\d+",
-    r"ios\s*\d+",
-    r"api\s*(?:level\s*)?\d+",
+# ─────────────────────────────────────────────────────────────
+# HIGH terms — core feature works but has meaningful defect
+# ─────────────────────────────────────────────────────────────
+HIGH_TERMS = [
+    # Messaging functional
+    "send message", "message sent", "receive message",
+    "forward message", "reply", "delete message", "unsend",
+    "voice message", "send file", "send photo", "send video",
+    "send document", "send attachment", "send sticker", "send emoji",
+    "delivered", "read receipt", "typing indicator",
+    # Calls functional
+    "voice call", "video call", "call started", "incoming call", "outgoing call",
+    "answer call", "decline call", "missed call", "end call",
+    "mute", "unmute", "speaker", "switch camera", "call quality",
+    "hold call", "resume call", "ringing",
+    # Auth functional
+    "login", "sign in", "sign up", "register",
+    "two-step", "two factor", "biometric", "fingerprint", "face id",
+    "change password", "reset password",
+    # Story / status functional
+    "post story", "view story", "reply to story", "story reaction",
+    "upload photo", "upload video", "story seen",
+    # Channel functional
+    "follow channel", "unfollow", "join channel", "leave channel",
+    "channel post", "subscribe",
+    # Notification functional
+    "push notification", "receive notification", "notification not received",
+    # Privacy / account
+    "block user", "unblock", "report user",
+    "privacy settings", "account settings",
+    # Media playback
+    "media not playing", "video not playing", "audio not playing",
+    "playback issue", "cannot play",
 ]
 
 # ─────────────────────────────────────────────────────────────
-# Device-specific signals (informational only)
+# MEDIUM terms — secondary UX, non-blocking
 # ─────────────────────────────────────────────────────────────
-LOW_END_DEVICES = [
+MEDIUM_TERMS = [
+    # Lists & navigation
+    "search", "filter", "sort", "list", "chat list", "contact list",
+    "channel list", "history", "call log", "call history",
+    "story list", "story viewer", "story duration",
+    # UI components (functional)
+    "tab", "menu", "panel", "picker", "keyboard",
+    "scroll", "swipe", "gesture", "navigation",
+    # Settings & profile (non-critical)
+    "settings", "profile", "preferences", "toggle", "switch",
+    "notification settings", "storage", "backup", "linked devices",
+    "language", "theme", "font",
+    # Secondary info
+    "last seen", "online status", "chat info", "group info",
+    "member list", "channel info", "discovery",
+    "badge", "unread count", "preview",
+    "archive", "mute chat", "pin chat",
+    # Timer / duration display
+    "timer", "duration", "timestamp", "date",
+    # Minor functional gaps
+    "not shown", "not displayed", "missing",
+    "incorrect", "wrong",
+]
+
+# ─────────────────────────────────────────────────────────────
+# LOW — purely cosmetic, no functional impact
+# Only applied when NO High/Gating signal is present
+# ─────────────────────────────────────────────────────────────
+LOW_COSMETIC_TERMS = [
+    # Alignment & layout
+    "misalign", "misaligned", "not aligned", "off center",
+    "overlap", "overlapping", "overlaps",
+    "truncat", "cut off", "clipped",
+    "padding", "margin issue", "spacing",
+    # Visual
+    "wrong color", "incorrect color", "wrong colour",
+    "wrong font", "font size issue",
+    "icon missing", "wrong icon", "broken image",
+    "placeholder", "shimmer stuck",
+    "ui glitch", "visual glitch", "render glitch",
+    "flicker", "blink",
+    # Cosmetic animation
+    "animation glitch", "transition glitch", "scroll animation",
+    "janky", "jank",
+    # Dark mode cosmetic
+    "dark mode color", "dark mode icon",
+    "theme color wrong", "incorrect theme color",
+    # Text / string cosmetic
+    "typo", "spelling mistake", "wrong label",
+    "incorrect string", "wrong string", "string issue",
+    "label missing",
+]
+
+# Hard crash terms — these override device-specific downgrade
+HARD_CRASH_TERMS = [
+    "crash", "freeze", "hang", "anr", "not responding",
+    "force close", "black screen", "white screen", "blank screen",
+]
+
+# ─────────────────────────────────────────────────────────────
+# Device / OS scope detection
+# ─────────────────────────────────────────────────────────────
+
+# Specific device models (low-end or notable)
+SPECIFIC_DEVICES = [
+    # Samsung
     "samsung a02", "samsung a03", "samsung a04", "samsung a05",
-    "samsung a13", "samsung a14", "samsung m13", "samsung m14",
+    "samsung a13", "samsung a14", "samsung a23", "samsung a24",
+    "samsung a32", "samsung a33", "samsung a52", "samsung a53",
+    "samsung m13", "samsung m14", "samsung m23",
     "galaxy a02", "galaxy a03", "galaxy a04", "galaxy a05",
-    "galaxy a13", "galaxy a14", "galaxy m13", "galaxy m14",
-    "redmi 9", "redmi 10", "redmi 12",
-    "redmi note 9", "redmi note 10",
-    "poco m2", "poco m3", "poco m4",
+    "galaxy a13", "galaxy a14", "galaxy a23", "galaxy a33",
+    "galaxy m13", "galaxy m14",
+    # Xiaomi / Redmi / POCO
+    "redmi 9", "redmi 10", "redmi 12", "redmi 13",
+    "redmi note 9", "redmi note 10", "redmi note 11", "redmi note 12",
+    "poco m2", "poco m3", "poco m4", "poco m5",
     "poco c3", "poco c4", "poco c5",
+    "poco x3", "poco x4", "poco x5",
+    "xiaomi 11 lite", "xiaomi 12 lite",
+    # Tecno / Infinix / Itel
     "tecno spark", "tecno pop", "tecno camon",
     "infinix hot", "infinix smart", "infinix note",
     "itel a", "itel p",
+    # Realme
     "realme c11", "realme c21", "realme c31", "realme c51",
-    "low end", "low-end", "budget device",
-    "entry level", "entry-level",
-    "1gb ram", "2gb ram", "32gb storage",
+    "realme c55", "realme narzo",
+    # iPhone models
+    "iphone 6", "iphone 7", "iphone 8", "iphone se",
+    "iphone x", "iphone xr", "iphone xs",
+    "iphone 11", "iphone 12", "iphone 13", "iphone 14", "iphone 15",
+    # iPad
+    "ipad mini", "ipad air", "ipad pro",
+    # Generic budget signals
+    "low end device", "low-end device", "budget device",
+    "entry level device", "entry-level device",
 ]
 
-CHIPSET_SIGNALS = [
-    "snapdragon 4", "snapdragon 6",
-    "mediatek helio g", "mediatek helio a",
+SPECIFIC_CHIPSETS = [
+    "snapdragon 4", "snapdragon 6", "snapdragon 480",
+    "mediatek helio g", "mediatek helio a", "mediatek helio p",
     "unisoc", "spreadtrum",
-    "exynos 7", "exynos 8",
+    "exynos 7", "exynos 8", "exynos 850",
 ]
 
-SINGLE_DEVICE_SIGNALS = [
-    "only on this device", "this specific device",
-    "reproduces on", "reproduced on", "repro on",
-    "device specific", "device-specific",
-    "one device only", "single device",
-    "cannot reproduce on other",
-    "affects only this",
+# OS version patterns
+OS_VERSION_RE = [
+    r"android\s*(\d+)",
+    r"ios\s*(\d+)",
+    r"api\s*(?:level\s*)?(\d+)",
+    r"ipados\s*(\d+)",
 ]
 
-LATEST_VERSION_SIGNALS = [
-    "latest version", "latest build", "latest release",
-    "beta version", "beta build", "release candidate", "rc build",
-    "canary build", "nightly build",
-    "after update", "after upgrade", "since update", "since upgrade",
+# Single-device repro signals
+SINGLE_DEVICE_RE = [
+    r"only on .{3,40}",
+    r"repro(?:duce[sd]?)? on .{3,40}",
+    r"observed on .{3,40}",
+    r"tested on .{3,40} only",
+    r"specific to .{3,40}",
+    r"cannot reproduce on other",
+    r"only this device",
+    r"device[- ]specific",
+    r"single device",
 ]
 
-# ─────────────────────────────────────────────────────────────
-# UI edge case signals → forced Low
-# Pure cosmetic / visual glitch / alignment issues
-# ─────────────────────────────────────────────────────────────
-UI_EDGE_TERMS = [
-    # Layout & alignment
-    "misalign", "misaligned", "overlap", "overlapping",
-    "truncat", "cut off", "clipped", "overflow",
-    "padding", "margin", "spacing issue",
-    "not centered", "off center", "alignment",
-    # Visual cosmetic
-    "color wrong", "wrong color", "wrong colour", "colour wrong",
-    "font size", "wrong font", "text size",
-    "icon missing", "icon wrong", "wrong icon",
-    "image not loading", "image broken", "broken image",
-    "placeholder visible", "shimmer",
-    # Minor UI glitch
-    "ui glitch", "visual glitch", "flicker", "flickering",
-    "blink", "blinking",
-    "layout issue", "layout bug", "ui issue", "ui bug",
-    "rendering issue", "render glitch",
-    # Cosmetic scroll / animation
-    "scroll animation", "animation glitch", "transition glitch",
-    "scroll lag", "janky", "jank",
-    # Dark mode cosmetic
-    "dark mode color", "dark mode icon", "dark mode text",
-    "theme color", "incorrect theme",
-    # Minor label / string
-    "wrong label", "label missing", "string missing",
-    "typo", "spelling",
-    "wrong string", "incorrect string",
-]
 
-# Important UI things that should NOT be forced Low
-# (if these appear alongside UI_EDGE_TERMS, UI edge rule is skipped)
-UI_EDGE_EXCEPTIONS = [
-    "crash", "freeze", "hang", "anr",
-    "cannot", "can't", "unable", "fail", "failed",
-    "not working", "broken", "error", "does not work",
-    "not sent", "not received", "not delivered",
-    "black screen", "white screen", "blank screen",
-]
+def detect_device_os_scope(text: str) -> Tuple[bool, str, str]:
+    """
+    Returns (is_scoped, scope_type, scope_detail).
+    scope_type: 'device' | 'os_version' | 'chipset' | 'single_device_repro' | ''
+    scope_detail: human-readable label e.g. 'Samsung A13' or 'Android 12'
+    """
+    t = text.lower()
 
-# ─────────────────────────────────────────────────────────────
-# Core scenario keyword sets
-# ─────────────────────────────────────────────────────────────
-GATING_TERMS = [
-    # App lifecycle
-    "crash", "freeze", "hang", "stuck", "anr",
-    "black screen", "white screen", "blank screen",
-    "force close", "not responding", "app not responding",
-    # Open / launch
-    "cannot open", "can't open", "not open", "fails to open",
-    "app not launching", "splash screen stuck",
-    # Messaging
-    "cannot send", "can't send", "message not sent", "fails to send",
-    "cannot receive", "can't receive", "not received",
-    "message failed", "chat not loading", "cannot open chat",
-    "messages not delivered", "data loss", "message lost", "messages missing",
-    # Auth
-    "login fail", "cannot login", "login error", "sign in fail",
-    "cannot register", "registration fail",
-    # Calls
-    "cannot start call", "call not started", "cannot call", "call fail",
-    "call dropped", "call disconnected", "no audio", "no video",
-    "mic not working", "camera not working", "cannot join call",
-    # Other core
-    "cannot save", "settings not saved", "cannot logout",
-    "status not loading", "cannot upload", "cannot post",
-    "cannot open channel", "channel not loading", "feed not loading",
-    "cannot view", "not loading",
-]
+    # 1. Specific device
+    for dev in SPECIFIC_DEVICES:
+        if dev in t:
+            return True, "device", dev.title()
 
-HIGH_TERMS = [
-    # Messaging
-    "send message", "message sent", "receive message", "message received",
-    "forward message", "reply message", "delete message", "unsend",
-    "send emoji", "emoji sent", "send sticker", "sticker sent",
-    "send file", "send photo", "send video", "send document",
-    "reaction", "delivered", "read receipt", "typing",
-    "voice message", "attachment", "media message",
-    # Calls
-    "voice call", "video call", "call started", "incoming call", "outgoing call",
-    "answer call", "decline call", "missed call", "end call",
-    "mute", "speaker", "switch camera", "call quality",
-    "hold", "resume call", "ringing",
-    # Auth & account
-    "login", "sign in", "register", "sign up",
-    "change password", "two-step", "two factor", "privacy",
-    "block user", "report user",
-    # Story / status
-    "post story", "view story", "reply story", "story reaction",
-    "upload photo", "upload video",
-    # Channel
-    "follow", "unfollow", "join channel", "leave channel",
-    "channel post", "channel message",
-    # Notification (functional)
-    "push notification", "receive notification",
-]
+    # 2. Chipset
+    for chip in SPECIFIC_CHIPSETS:
+        if chip in t:
+            return True, "chipset", chip.title()
 
-MEDIUM_TERMS = [
-    "search", "category", "panel", "picker", "keyboard", "tab", "scroll",
-    "display", "shown", "settings", "profile", "notification settings", "ui",
-    "history", "log", "list", "filter", "duration", "timer",
-    "toggle", "badge", "banner", "preview",
-    "contact", "group", "archive", "mute",
-    "seen", "last seen", "chat info", "chat list",
-    "story viewer", "story list", "story duration",
-    "call history", "call log", "call screen", "dialpad",
-    "channel list", "member list", "channel info",
-    "linked devices", "storage", "backup",
-    "discover", "explore",
-]
+    # 3. OS version
+    for pat in OS_VERSION_RE:
+        m = re.search(pat, t, re.IGNORECASE)
+        if m:
+            full = m.group(0).strip()
+            return True, "os_version", full.title()
+
+    # 4. Single-device repro phrase
+    for pat in SINGLE_DEVICE_RE:
+        m = re.search(pat, t, re.IGNORECASE)
+        if m:
+            return True, "single_device_repro", m.group(0).strip().title()
+
+    return False, "", ""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -237,10 +297,10 @@ def normalize_priority(p) -> str:
         return ""
     s  = str(p).strip()
     sl = s.lower()
-    if sl in {"gating", "gate", "blocker"}:           return "Gating"
-    if sl in {"high", "p1", "h", "critical"}:         return "High"
-    if sl in {"medium", "med", "p2", "m", "normal"}:  return "Medium"
-    if sl in {"low", "p3", "l", "minor"}:             return "Low"
+    if sl in {"gating", "gate", "blocker", "critical", "p0"}:   return "Gating"
+    if sl in {"high", "p1", "h"}:                                return "High"
+    if sl in {"medium", "med", "p2", "m", "normal", "moderate"}: return "Medium"
+    if sl in {"low", "p3", "l", "minor", "trivial"}:             return "Low"
     return s[:1].upper() + s[1:] if s else ""
 
 
@@ -251,113 +311,83 @@ def contains_any(text: str, terms: List[str]) -> bool:
     return False
 
 
-def matches_pattern(text: str, patterns: List[str]) -> bool:
-    for pat in patterns:
-        if re.search(pat, text, re.IGNORECASE):
-            return True
-    return False
+def is_hard_crash(text: str) -> bool:
+    return contains_any(text, HARD_CRASH_TERMS)
 
 
 # ─────────────────────────────────────────────────────────────
-# Platform detection
+# Priority decision
 # ─────────────────────────────────────────────────────────────
-def detect_platform(text: str) -> str:
-    """Returns 'Android' | 'iOS' | 'Both' | ''"""
-    t   = text.lower()
-    has_android = contains_any(t, ANDROID_SIGNALS) or matches_pattern(t, OS_VERSION_PATTERNS[:3])
-    has_ios     = contains_any(t, IOS_SIGNALS)     or matches_pattern(t, OS_VERSION_PATTERNS[3:])
-
-    # Version pattern check more carefully
-    if re.search(r"android\s*\d+", t):     has_android = True
-    if re.search(r"ios\s*\d+", t):         has_ios     = True
-
-    if has_android and has_ios: return "Both"
-    if has_android:             return "Android"
-    if has_ios:                 return "iOS"
-    return ""
-
-
-# ─────────────────────────────────────────────────────────────
-# Device-specific detection (informational only)
-# ─────────────────────────────────────────────────────────────
-def detect_device_scope(text: str) -> Tuple[bool, str]:
-    """Returns (is_device_specific, scope_label)."""
-    t = text.lower()
-    if contains_any(t, LOW_END_DEVICES):     return True, "low_end_device"
-    if contains_any(t, CHIPSET_SIGNALS):     return True, "chipset"
-    if contains_any(t, SINGLE_DEVICE_SIGNALS): return True, "single_device"
-    if contains_any(t, LATEST_VERSION_SIGNALS): return True, "latest_version"
-    if re.search(r"android\s*\d+|ios\s*\d+|api\s*(?:level\s*)?\d+", t):
-        return True, "os_version"
-    return False, ""
-
-
-# ─────────────────────────────────────────────────────────────
-# UI edge case detection
-# ─────────────────────────────────────────────────────────────
-def is_ui_edge_case(text: str) -> bool:
-    """
-    True if scenario is a pure cosmetic/visual edge case.
-    Skipped if any functional failure keyword is present.
-    """
-    t = text.lower()
-    if not contains_any(t, UI_EDGE_TERMS):
-        return False
-    # Don't force Low if there's also a real functional failure
-    if contains_any(t, UI_EDGE_EXCEPTIONS):
-        return False
-    return True
-
-
-# ─────────────────────────────────────────────────────────────
-# Per-row decision
-# ─────────────────────────────────────────────────────────────
-def decide_priority(text: str) -> Tuple[str, str, bool, str, str]:
+def decide_priority(text: str) -> Tuple[str, bool, str, str, str]:
     """
     Returns:
-        stp_priority   : Gating | High | Medium | Low
-        platform       : Android | iOS | Both | ''
-        is_device_spec : bool
-        device_scope   : str
-        reason         : str
+        stp_priority  : Gating | High | Medium | Low
+        is_scoped     : bool
+        scope_type    : device | os_version | chipset | single_device_repro | ''
+        scope_detail  : e.g. 'Android 12', 'Samsung A13'
+        reason        : human-readable explanation
     """
     t = text.lower()
 
-    platform              = detect_platform(t)
-    is_device, dev_scope  = detect_device_scope(t)
-    ui_edge               = is_ui_edge_case(t)
+    # Step 1 — detect device/OS scope
+    is_scoped, scope_type, scope_detail = detect_device_os_scope(t)
 
-    # Priority decision tree
-    if ui_edge:
-        priority = "Low"
-        reason   = "UI / cosmetic edge case — visual only"
-    elif contains_any(t, GATING_TERMS):
-        priority = "Gating"
-        reason   = REASON_MAP["Gating"]
-    elif contains_any(t, HIGH_TERMS):
-        priority = "High"
-        reason   = REASON_MAP["High"]
-    elif contains_any(t, MEDIUM_TERMS):
-        priority = "Medium"
-        reason   = REASON_MAP["Medium"]
+    # Step 2 — base priority from keywords
+    # Cosmetic check: if ONLY cosmetic signals present (no Gating/High signal), force Low
+    # Medium terms are secondary — cosmetic overrides them if nothing functional is present
+    has_gating   = contains_any(t, GATING_TERMS)
+    has_high     = contains_any(t, HIGH_TERMS)
+    has_medium   = contains_any(t, MEDIUM_TERMS)
+    has_cosmetic = contains_any(t, LOW_COSMETIC_TERMS)
+
+    if has_gating:
+        base = "Gating"
+    elif has_high:
+        base = "High"
+    elif has_cosmetic and not has_gating and not has_high:
+        # Pure cosmetic: medium signals like "settings", "wrong" don't override cosmetic
+        base = "Low"
+    elif has_medium:
+        base = "Medium"
     else:
-        priority = "Low"
-        reason   = REASON_MAP["Low"]
+        base = "Low"
 
-    # Append device-specific note to reason (no priority change)
-    if is_device:
-        reason = f"{reason} [device: {dev_scope}]"
+    # Step 3 — adjust for device/OS scope
+    if not is_scoped:
+        priority = base
+        reason   = REASON_MAP[priority]
+    else:
+        scope_note = f"{scope_type.replace('_', ' ').title()}: {scope_detail}"
 
-    return priority, platform, is_device, dev_scope, reason
+        if is_hard_crash(t):
+            # Crash on any device/OS stays Gating — a crash is never acceptable
+            priority = "Gating"
+            reason   = f"{REASON_MAP['Gating']} — crash on specific scope [{scope_note}]"
+        elif base == "Gating":
+            # Non-crash Gating on specific device/OS → High
+            # (e.g. "cannot send on Samsung A13" — bad but not universal blocker)
+            priority = "High"
+            reason   = f"{REASON_MAP['High']} — scoped issue, not universal [{scope_note}]"
+        elif base == "High":
+            # High on specific device/OS → Medium
+            priority = "Medium"
+            reason   = f"{REASON_MAP['Medium']} — scoped to specific device/OS [{scope_note}]"
+        else:
+            # Medium/Low stays as-is, just annotated
+            priority = base
+            reason   = f"{REASON_MAP[base]} [{scope_note}]"
+
+    return priority, is_scoped, scope_type, scope_detail, reason
 
 
 # ─────────────────────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────────────────────
+PRIORITY_ORDER = ["Gating", "High", "Medium", "Low"]
+
 def run_stp(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Returns (analysis_df, summary_df, diff_df).
-    No feature param needed — platform-based, not feature-based.
     """
     validate_columns(df)
 
@@ -369,15 +399,14 @@ def run_stp(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
     out["Expected"]         = df["Custom field (Scenario Expected Result)"].fillna("").astype(str)
 
     text_col = (out["Summary"] + " " + out["Steps"] + " " + out["Expected"]).str.lower()
+    results  = text_col.apply(decide_priority)
 
-    results = text_col.apply(decide_priority)
-
-    out["STP Priority"]    = results.apply(lambda r: r[0])
-    out["Platform"]        = results.apply(lambda r: r[1])
-    out["Device Specific"] = results.apply(lambda r: "Yes" if r[2] else "")
-    out["Device Scope"]    = results.apply(lambda r: r[3])
-    out["Changed"]         = out["Current Priority"] != out["STP Priority"]
-    out["Reason"]          = results.apply(lambda r: r[4])
+    out["STP Priority"] = results.apply(lambda r: r[0])
+    out["Scoped"]       = results.apply(lambda r: "Yes" if r[1] else "")
+    out["Scope Type"]   = results.apply(lambda r: r[2].replace("_", " ").title() if r[2] else "")
+    out["Scope Detail"] = results.apply(lambda r: r[3])
+    out["Changed"]      = out["Current Priority"] != out["STP Priority"]
+    out["Reason"]       = results.apply(lambda r: r[4])
 
     # Summary
     cur_c = out["Current Priority"].value_counts(dropna=False).to_dict()

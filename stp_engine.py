@@ -1,348 +1,420 @@
 """
-STP Engine — deterministic, scenario-aware, device-specific detection.
-Same CSV -> same output every time.
-
-Device-specific logic:
-  If a test case contains device-specific signals (low-end device names,
-  specific OS versions, chipsets, single-device mentions, latest-version scope)
-  the base STP priority is DOWNGRADED one level:
-    Gating -> High, High -> Medium, Medium -> Low
-
-  Exception: crash/freeze/hang on any device stays Gating.
-  (Controlled by DEVICE_CRASH_STAYS_GATING flag.)
+STP Streamlit App — platform-aware (Android / iOS / Both)
+Upload Android CSV, iOS CSV, or both. Engine runs without feature selection.
 """
 
-import re
-from typing import Dict, List, Tuple
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import pandas as pd
+import streamlit as st
 
-# ─────────────────────────────────────────────────────────────
-# Required columns — exact match, no fallback
-# ─────────────────────────────────────────────────────────────
-REQUIRED_COLS = [
-    "Issue key",
-    "Priority",
-    "Summary",
-    "Custom field (Manual Test Steps)",
-    "Custom field (Scenario Expected Result)",
-]
+sys.path.insert(0, str(Path(__file__).parent))
+from stp_engine import run_stp, PRIORITY_ORDER
 
-PRIORITY_ORDER    = ["Gating", "High", "Medium", "Low"]
-PRIORITY_RANK     = {"Gating": 0, "High": 1, "Medium": 2, "Low": 3}
-PRIORITY_FROM_RANK = {0: "Gating", 1: "High", 2: "Medium", 3: "Low"}
+BUILD_PPT_SCRIPT = str(Path(__file__).parent / "build_ppt.js")
 
-REASON_MAP = {
-    "Gating": "Core functionality broken",
-    "High":   "Core feature validation",
-    "Medium": "UX / secondary behaviour",
-    "Low":    "Edge validation",
+PRIORITY_COLOR = {
+    "Gating": "#E53935",
+    "High":   "#FB8C00",
+    "Medium": "#1E88E5",
+    "Low":    "#43A047",
 }
 
-# Crash on a specific device still stays Gating — a crash is a crash
-DEVICE_CRASH_STAYS_GATING = True
-
-# ─────────────────────────────────────────────────────────────
-# Device-specific signal lists
-# ─────────────────────────────────────────────────────────────
-LOW_END_DEVICES = [
-    # Samsung budget
-    "samsung a03", "samsung a04", "samsung a05", "samsung a13", "samsung a14",
-    "galaxy a03", "galaxy a04", "galaxy a05", "galaxy a13", "galaxy a14",
-    "samsung m13", "samsung m14", "galaxy m13", "galaxy m14",
-    "samsung a02", "galaxy a02",
-    # Xiaomi / Redmi / POCO budget
-    "redmi 9", "redmi 10", "redmi 12", "redmi note 9", "redmi note 10",
-    "poco m2", "poco m3", "poco m4", "poco c3", "poco c4", "poco c5",
-    "xiaomi 12 lite", "xiaomi redmi",
-    # Tecno / Infinix / Itel
-    "tecno spark", "tecno pop", "tecno camon",
-    "infinix hot", "infinix smart", "infinix note",
-    "itel a", "itel p",
-    # Realme budget
-    "realme c11", "realme c21", "realme c31", "realme c51",
-    # General budget signals
-    "low end", "low-end", "budget device", "entry level", "entry-level",
-    "2gb ram", "1gb ram", "32gb storage", "16gb storage",
-]
-
-OS_VERSION_PATTERNS = [
-    r"android\s*(4|5|6|7|8|9|10|11|12|13|14)[\.\s]",
-    r"android\s*(4|5|6|7|8|9|10|11|12|13|14)$",
-    r"api\s*(?:level\s*)?(19|21|22|23|24|25|26|27|28|29|30|31|32|33|34)\b",
-    r"ios\s*(12|13|14|15|16|17)[\.\s]",
-    r"ios\s*(12|13|14|15|16|17)$",
-    r"on (?:android|ios) \d+",
-    r"(?:android|ios) version \d+",
-]
-
-CHIPSET_SIGNALS = [
-    "snapdragon 4", "snapdragon 6",
-    "mediatek helio g", "mediatek helio a",
-    "unisoc", "spreadtrum",
-    "exynos 7", "exynos 8",
-]
-
-SINGLE_DEVICE_SIGNALS = [
-    "only on", "only this device", "this specific device",
-    "reproduces on", "reproduced on", "repro on",
-    "tested on specific", "observed on specific",
-    "device specific", "device-specific",
-    "one device only", "single device",
-    "specific to device", "affects only this",
-    "cannot reproduce on other",
-]
-
-LATEST_VERSION_SIGNALS = [
-    "latest version", "latest build", "latest release",
-    "beta version", "beta build", "release candidate", "rc build",
-    "canary build", "nightly build",
-    "new version", "new update", "after update", "after upgrade",
-    "since update", "since upgrade", "version update",
-]
-
-HARD_CRASH_TERMS = [
-    "crash", "freeze", "hang", "anr", "not responding",
-    "force close", "black screen", "blank screen", "white screen",
-]
-
-# ─────────────────────────────────────────────────────────────
-# Base scenario keyword sets
-# ─────────────────────────────────────────────────────────────
-BASE_GATING = [
-    "crash", "freeze", "hang", "stuck", "anr",
-    "cannot open", "can't open", "not open", "fails to open",
-    "cannot send", "can't send", "message not sent", "fails to send",
-    "cannot receive", "can't receive", "not received",
-    "login fail", "cannot login", "login error", "sign in fail",
-    "cannot start call", "call not started", "cannot call", "call fail",
-    "black screen", "white screen", "blank screen",
-    "force close", "not responding", "app not responding",
-    "data loss", "message lost", "messages missing",
-]
-
-BASE_HIGH = [
-    "send message", "message sent", "receive message", "message received",
-    "voice call", "video call", "call started", "incoming call", "outgoing call",
-    "send emoji", "emoji sent", "send sticker", "sticker sent",
-    "reaction", "delivered", "read receipt",
-    "login", "sign in", "register", "sign up",
-    "send file", "send photo", "send video", "send document",
-    "forward message", "reply message",
-]
-
-BASE_MEDIUM = [
-    "search", "category", "panel", "picker", "keyboard", "tab", "icon", "scroll",
-    "display", "shown", "settings", "profile", "notification", "ui",
-    "history", "log", "list", "filter", "duration", "timer",
-    "toggle", "badge", "banner", "preview",
-    "contact", "group", "archive", "mute",
-]
-
-# ─────────────────────────────────────────────────────────────
-# Feature-specific keyword expansions
-# ─────────────────────────────────────────────────────────────
-FEATURE_TERMS: Dict[str, Dict[str, List[str]]] = {
-    "calls": {
-        "gating": ["no audio", "no video", "mic not working", "camera not working",
-                   "cannot join call", "call dropped", "call disconnected",
-                   "audio not working", "can't hear", "cannot hear"],
-        "high":   ["mute", "speaker", "switch camera", "call ended", "ringing",
-                   "hold", "resume call", "call quality", "end call",
-                   "answer call", "decline call", "missed call"],
-        "medium": ["call screen", "dialpad", "call history", "call ui", "call log",
-                   "call duration", "end call button", "call timer", "call notification"],
-    },
-    "chats": {
-        "gating": ["cannot message", "messages not delivered", "chat not loading",
-                   "cannot open chat", "message failed", "chat error"],
-        "high":   ["typing", "seen", "forward", "reply", "pin message", "delete message",
-                   "unsend", "attachment", "media message", "voice message"],
-        "medium": ["chat list", "conversation", "unread", "pin chat", "archive",
-                   "mute chat", "search message", "chat info", "last seen"],
-    },
-    "channels": {
-        "gating": ["cannot open channel", "channel not loading", "cannot post",
-                   "channel error", "feed not loading"],
-        "high":   ["follow", "unfollow", "join channel", "leave channel", "subscribe",
-                   "channel post", "channel message", "share channel"],
-        "medium": ["discover", "category list", "search channel", "channel list",
-                   "channel info", "member list", "channel settings"],
-    },
-    "status": {
-        "gating": ["status not loading", "cannot upload story", "story not posted",
-                   "status error", "cannot view status"],
-        "high":   ["post story", "view story", "reply story", "story reaction",
-                   "story seen", "upload photo", "upload video", "story viewers"],
-        "medium": ["story viewer", "status ui", "story list", "story duration",
-                   "story privacy", "story settings", "my status"],
-    },
-    "story": {
-        "gating": ["status not loading", "cannot upload story", "story not posted"],
-        "high":   ["post story", "view story", "reply story", "story reaction"],
-        "medium": ["story viewer", "status ui", "story list"],
-    },
-    "more": {
-        "gating": ["cannot save settings", "settings not saved", "cannot logout",
-                   "logout fail", "cannot delete account"],
-        "high":   ["change language", "change theme", "privacy", "block user",
-                   "report user", "account", "two-step verification", "backup"],
-        "medium": ["toggle", "switch", "preference", "help", "about", "storage usage",
-                   "notification settings", "linked devices"],
-    },
-    "settings": {
-        "gating": ["cannot save settings", "settings not saved", "settings crash"],
-        "high":   ["change language", "change theme", "privacy", "two factor",
-                   "two-step", "account info", "change number"],
-        "medium": ["toggle", "preference", "notification settings", "storage",
-                   "chat backup", "chat history"],
-    },
-    "others": {
-        "gating": ["app not launching", "splash screen stuck", "onboarding fail"],
-        "high":   ["deep link", "push notification", "share", "qr code"],
-        "medium": ["widget", "shortcut", "app icon", "language", "theme"],
-    },
+PLATFORM_COLOR = {
+    "Android": "#3DDC84",
+    "iOS":     "#007AFF",
+    "Both":    "#9C27B0",
+    "":        "#888888",
 }
+
+SCOPE_LABEL = {
+    "low_end_device": "Low-end device",
+    "os_version":     "OS version",
+    "chipset":        "Chipset",
+    "single_device":  "Single device repro",
+    "latest_version": "Latest version / beta",
+    "":               "",
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# PPT builder
+# ─────────────────────────────────────────────────────────────
+def build_executive_ppt(platform_results: List[Dict]) -> Optional[bytes]:
+    payload = json.dumps({"platforms": platform_results})
+    with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as f:
+        out_path = f.name
+    try:
+        result = subprocess.run(
+            ["node", BUILD_PPT_SCRIPT, payload, out_path],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0 or not os.path.exists(out_path):
+            st.error(f"PPT build failed:\n{result.stderr}")
+            return None
+        with open(out_path, "rb") as f:
+            return f.read()
+    except Exception as e:
+        st.error(f"PPT build error: {e}")
+        return None
+    finally:
+        if os.path.exists(out_path):
+            os.unlink(out_path)
 
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
-def normalize_feature(feature: str) -> str:
-    return re.sub(r"\s+", "", (feature or "").strip())
+def df_to_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    df.to_csv(buf, index=False, encoding="utf-8-sig")
+    return buf.getvalue()
 
 
-def get_terms(feature: str) -> Tuple[List[str], List[str], List[str]]:
-    key = normalize_feature(feature).lower()
-    extra  = FEATURE_TERMS.get(key, {"gating": [], "high": [], "medium": []})
-    gating = [t.lower() for t in BASE_GATING + extra.get("gating", [])]
-    high   = [t.lower() for t in BASE_HIGH   + extra.get("high",   [])]
-    medium = [t.lower() for t in BASE_MEDIUM + extra.get("medium", [])]
-    return gating, high, medium
+def render_summary_table(summary_df: pd.DataFrame):
+    rows_html = ""
+    for _, row in summary_df.iterrows():
+        pr    = row["Priority"]
+        color = PRIORITY_COLOR.get(pr, "#888")
+        chg   = int(row["Change"])
+        chg_s = f"+{chg}" if chg > 0 else str(chg)
+        c_col = "#E53935" if chg > 0 else "#43A047" if chg < 0 else "#888"
+        rows_html += f"""
+        <tr>
+          <td style="padding:7px 12px">
+            <span style="background:{color};color:#fff;padding:2px 10px;
+            border-radius:4px;font-weight:600;font-size:12px">{pr}</span>
+          </td>
+          <td style="text-align:center;padding:7px">{int(row['Current'])}</td>
+          <td style="text-align:center;padding:7px;font-weight:700">{int(row['STP'])}</td>
+          <td style="text-align:center;padding:7px;color:{c_col};font-weight:700">{chg_s}</td>
+          <td style="text-align:center;padding:7px;color:{c_col}">{row['Change %']}%</td>
+        </tr>"""
+    st.markdown(f"""
+    <table style="width:100%;border-collapse:collapse;font-size:14px;margin-bottom:12px">
+      <thead>
+        <tr style="background:#1E2761;color:#fff">
+          <th style="padding:8px 12px;text-align:left">Priority</th>
+          <th style="padding:8px;text-align:center">Current</th>
+          <th style="padding:8px;text-align:center">STP</th>
+          <th style="padding:8px;text-align:center">Change</th>
+          <th style="padding:8px;text-align:center">Change %</th>
+        </tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>""", unsafe_allow_html=True)
 
 
-def validate_columns(df: pd.DataFrame) -> None:
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        raise ValueError("Missing required columns:\n  " + "\n  ".join(missing))
+def render_platform_breakdown(analysis_df: pd.DataFrame):
+    """Platform distribution of the dataset."""
+    counts = analysis_df["Platform"].value_counts()
+    total  = len(analysis_df)
+    parts  = []
+    for plat, cnt in counts.items():
+        col = PLATFORM_COLOR.get(plat, "#888")
+        lbl = plat if plat else "Undetected"
+        pct = round(cnt / total * 100, 1)
+        parts.append(
+            f'<span style="background:{col};color:#fff;padding:3px 10px;'
+            f'border-radius:4px;font-size:12px;font-weight:600;margin-right:6px">'
+            f'{lbl}: {cnt} ({pct}%)</span>'
+        )
+    st.markdown(" ".join(parts), unsafe_allow_html=True)
 
 
-def normalize_priority(p) -> str:
-    if pd.isna(p):
-        return ""
-    s  = str(p).strip()
-    sl = s.lower()
-    if sl in {"gating", "gate", "blocker"}:            return "Gating"
-    if sl in {"high", "p1", "h", "critical"}:          return "High"
-    if sl in {"medium", "med", "p2", "m", "normal"}:   return "Medium"
-    if sl in {"low", "p3", "l", "minor"}:              return "Low"
-    return s[:1].upper() + s[1:] if s else ""
+def render_device_table(device_df: pd.DataFrame):
+    if device_df.empty:
+        st.info("No device-specific cases detected.")
+        return
+    rows_html = ""
+    for _, row in device_df.iterrows():
+        stp_col  = PRIORITY_COLOR.get(row["STP Priority"], "#888")
+        cur_col  = PRIORITY_COLOR.get(row["Current Priority"], "#888")
+        plat_col = PLATFORM_COLOR.get(row["Platform"], "#888")
+        scope    = SCOPE_LABEL.get(row["Device Scope"], row["Device Scope"])
+        plat     = row["Platform"] or "—"
+        changed  = row["Changed"]
+        arrow    = '<span style="color:#E53935">↓</span> ' if changed else '<span style="color:#888">→</span> '
+        rows_html += f"""
+        <tr style="background:#FFF8F0">
+          <td style="padding:6px 10px;font-family:monospace;font-size:12px">{row['Issue Key']}</td>
+          <td style="padding:6px 10px;font-size:12px;max-width:260px">{str(row['Summary'])[:85]}{'…' if len(str(row['Summary']))>85 else ''}</td>
+          <td style="padding:6px;text-align:center">
+            <span style="background:{plat_col};color:#fff;padding:1px 7px;border-radius:3px;font-size:11px">{plat}</span>
+          </td>
+          <td style="padding:6px;text-align:center">
+            <span style="background:{cur_col};color:#fff;padding:1px 7px;border-radius:3px;font-size:11px">{row['Current Priority']}</span>
+          </td>
+          <td style="padding:6px;text-align:center">
+            {arrow}<span style="background:{stp_col};color:#fff;padding:1px 7px;border-radius:3px;font-size:11px">{row['STP Priority']}</span>
+          </td>
+          <td style="padding:6px;text-align:center">
+            <span style="background:#FF6F00;color:#fff;padding:1px 7px;border-radius:3px;font-size:11px">{scope}</span>
+          </td>
+        </tr>"""
+    st.markdown(f"""
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead>
+        <tr style="background:#FF6F00;color:#fff">
+          <th style="padding:7px 10px;text-align:left">Issue Key</th>
+          <th style="padding:7px 10px;text-align:left">Summary</th>
+          <th style="padding:7px;text-align:center">Platform</th>
+          <th style="padding:7px;text-align:center">Current</th>
+          <th style="padding:7px;text-align:center">STP</th>
+          <th style="padding:7px;text-align:center">Device Scope</th>
+        </tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>""", unsafe_allow_html=True)
 
 
-def contains_any(text: str, terms: List[str]) -> bool:
-    for t in terms:
-        if t and t in text:
-            return True
-    return False
-
-
-def matches_any_pattern(text: str, patterns: List[str]) -> bool:
-    for pat in patterns:
-        if re.search(pat, text, re.IGNORECASE):
-            return True
-    return False
+def render_ui_edge_table(ui_df: pd.DataFrame):
+    if ui_df.empty:
+        st.info("No UI edge cases detected.")
+        return
+    rows_html = ""
+    for _, row in ui_df.iterrows():
+        cur_col = PRIORITY_COLOR.get(row["Current Priority"], "#888")
+        changed = row["Changed"]
+        arrow   = '<span style="color:#43A047">↓ Low</span>' if changed else '<span style="color:#888">Low</span>'
+        rows_html += f"""
+        <tr>
+          <td style="padding:6px 10px;font-family:monospace;font-size:12px">{row['Issue Key']}</td>
+          <td style="padding:6px 10px;font-size:12px;max-width:320px">{str(row['Summary'])[:95]}{'…' if len(str(row['Summary']))>95 else ''}</td>
+          <td style="padding:6px;text-align:center">
+            <span style="background:{cur_col};color:#fff;padding:1px 7px;border-radius:3px;font-size:11px">{row['Current Priority']}</span>
+          </td>
+          <td style="padding:6px;text-align:center">{arrow}</td>
+        </tr>"""
+    st.markdown(f"""
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead>
+        <tr style="background:#43A047;color:#fff">
+          <th style="padding:7px 10px;text-align:left">Issue Key</th>
+          <th style="padding:7px 10px;text-align:left">Summary</th>
+          <th style="padding:7px;text-align:center">Current Priority</th>
+          <th style="padding:7px;text-align:center">STP Priority</th>
+        </tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>""", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────
-# Device-specific detection
+# Process one uploaded file
 # ─────────────────────────────────────────────────────────────
-def detect_device_scope(text: str) -> Tuple[bool, str]:
-    """Returns (is_device_specific, scope_label)."""
-    t = text.lower()
-    if contains_any(t, LOW_END_DEVICES):         return True, "low_end_device"
-    if matches_any_pattern(t, OS_VERSION_PATTERNS): return True, "os_version"
-    if contains_any(t, CHIPSET_SIGNALS):         return True, "chipset"
-    if contains_any(t, SINGLE_DEVICE_SIGNALS):   return True, "single_device"
-    if contains_any(t, LATEST_VERSION_SIGNALS):  return True, "latest_version"
-    return False, ""
+def process_file(uploaded, platform_label: str) -> Optional[Dict]:
+    st.subheader(f"{'🤖' if 'android' in platform_label.lower() else '🍎'} {platform_label}  ·  {uploaded.name}")
 
+    try:
+        raw = uploaded.getvalue().decode("utf-8", errors="replace")
+        df  = pd.read_csv(io.StringIO(raw), sep=None, engine="python", on_bad_lines="skip")
+    except Exception as e:
+        st.error(f"Could not read CSV: {e}")
+        return None
 
-def is_hard_crash(text: str) -> bool:
-    return contains_any(text.lower(), HARD_CRASH_TERMS)
+    try:
+        analysis_df, summary_df, diff_df = run_stp(df)
+    except ValueError as e:
+        st.error(str(e))
+        return None
 
+    total         = len(analysis_df)
+    changed       = int(analysis_df["Changed"].sum())
+    device_cases  = analysis_df[analysis_df["Device Specific"] == "Yes"]
+    ui_edge_cases = analysis_df[analysis_df["Reason"].str.startswith("UI / cosmetic")]
+    gating_before = int(summary_df.loc[summary_df["Priority"] == "Gating", "Current"].iloc[0])
+    gating_after  = int(summary_df.loc[summary_df["Priority"] == "Gating", "STP"].iloc[0])
+    reduction     = gating_before - gating_after
 
-# ─────────────────────────────────────────────────────────────
-# Per-row decision
-# ─────────────────────────────────────────────────────────────
-def decide_priority(
-    text: str,
-    gating_terms: List[str],
-    high_terms: List[str],
-    medium_terms: List[str],
-) -> Tuple[str, bool, str, str]:
-    """Returns (stp_priority, is_device_specific, device_scope, reason)."""
+    # KPIs
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Total cases",     total)
+    k2.metric("Changed",         changed,
+              delta=f"{round(changed/total*100,1)}%" if total else None)
+    k3.metric("Gating before",   gating_before)
+    k4.metric("Gating after",    gating_after,
+              delta=f"−{reduction}" if reduction > 0 else str(reduction),
+              delta_color="inverse")
+    k5.metric("Device-specific", len(device_cases),   delta_color="off")
+    k6.metric("UI edge → Low",   len(ui_edge_cases[ui_edge_cases["Changed"]]), delta_color="off")
 
-    # 1 — base priority from scenario keywords
-    if contains_any(text, gating_terms):   base = "Gating"
-    elif contains_any(text, high_terms):   base = "High"
-    elif contains_any(text, medium_terms): base = "Medium"
-    else:                                  base = "Low"
-
-    # 2 — device-specific detection (informational only, priority unchanged)
-    is_device, scope = detect_device_scope(text)
-
-    reason = REASON_MAP.get(base, "Edge validation")
-    if is_device:
-        reason = f"{reason} — device-specific [{scope}]"
-
-    return base, is_device, scope, reason
-
-
-# ─────────────────────────────────────────────────────────────
-# Main entry point
-# ─────────────────────────────────────────────────────────────
-def run_stp(df: pd.DataFrame, feature: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Returns (analysis_df, summary_df, diff_df).
-    analysis_df : one row per test case with full STP output
-    summary_df  : priority-level counts (Current vs STP)
-    diff_df     : only rows where priority changed
-    """
-    validate_columns(df)
-    gating_terms, high_terms, medium_terms = get_terms(feature)
-
-    out = pd.DataFrame()
-    out["Issue Key"]        = df["Issue key"].astype(str)
-    out["Current Priority"] = df["Priority"].apply(normalize_priority)
-    out["Summary"]          = df["Summary"].fillna("").astype(str)
-    out["Steps"]            = df["Custom field (Manual Test Steps)"].fillna("").astype(str)
-    out["Expected"]         = df["Custom field (Scenario Expected Result)"].fillna("").astype(str)
-
-    text_col = (out["Summary"] + " " + out["Steps"] + " " + out["Expected"]).str.lower()
-
-    results = text_col.apply(
-        lambda t: decide_priority(t, gating_terms, high_terms, medium_terms)
-    )
-
-    out["STP Priority"]    = results.apply(lambda r: r[0])
-    out["Device Specific"] = results.apply(lambda r: "Yes" if r[1] else "")
-    out["Device Scope"]    = results.apply(lambda r: r[2])
-    out["Changed"]         = out["Current Priority"] != out["STP Priority"]
-    out["Reason"]          = results.apply(lambda r: r[3])
+    # Platform breakdown
+    st.markdown("**Platform distribution detected in dataset:**")
+    render_platform_breakdown(analysis_df)
+    st.markdown("")
 
     # Summary table
-    cur_c = out["Current Priority"].value_counts(dropna=False).to_dict()
-    stp_c = out["STP Priority"].value_counts(dropna=False).to_dict()
+    st.markdown("**Priority Summary**")
+    render_summary_table(summary_df)
 
-    rows = []
-    for pr in PRIORITY_ORDER:
-        cur = int(cur_c.get(pr, 0))
-        stp = int(stp_c.get(pr, 0))
-        chg = stp - cur
-        chg_pct = round(chg / cur * 100.0, 2) if cur != 0 else (0.0 if chg == 0 else 100.0)
-        rows.append([pr, cur, stp, chg, chg_pct])
+    # UI edge cases
+    ui_changed = ui_edge_cases[ui_edge_cases["Changed"]]
+    if not ui_edge_cases.empty:
+        with st.expander(
+            f"🎨 UI Edge Cases — {len(ui_changed)} downgraded to Low ({len(ui_edge_cases)} total detected)",
+            expanded=True,
+        ):
+            render_ui_edge_table(
+                ui_edge_cases[["Issue Key", "Summary", "Current Priority", "STP Priority", "Changed"]]
+            )
 
-    summary_df = pd.DataFrame(rows, columns=["Priority", "Current", "STP", "Change", "Change %"])
-    diff_df    = out[out["Changed"]].copy().reset_index(drop=True)
+    # Device-specific
+    if not device_cases.empty:
+        with st.expander(
+            f"📱 Device-specific cases ({len(device_cases)}) — priority unchanged, flagged for info",
+            expanded=False,
+        ):
+            render_device_table(
+                device_cases[["Issue Key", "Summary", "Platform",
+                              "Current Priority", "STP Priority", "Device Scope", "Changed"]]
+            )
 
-    return out, summary_df, diff_df
+    # All changed
+    if not diff_df.empty:
+        with st.expander(f"All changed rows ({len(diff_df)})", expanded=False):
+            show = ["Issue Key", "Summary", "Current Priority", "STP Priority",
+                    "Platform", "Device Specific", "Device Scope", "Reason"]
+            st.dataframe(diff_df[show], use_container_width=True, hide_index=True)
+
+    # Full table
+    with st.expander("Full analysis table", expanded=False):
+        show_all = ["Issue Key", "Summary", "Current Priority", "STP Priority",
+                    "Platform", "Device Specific", "Device Scope", "Changed", "Reason"]
+        st.dataframe(analysis_df[show_all], use_container_width=True, hide_index=True)
+
+    # Downloads
+    safe = platform_label.replace(" ", "")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.download_button("⬇ Analysis CSV", df_to_bytes(analysis_df),
+                           f"STPANALYSIS_{safe}.csv", "text/csv",
+                           key=f"dl_a_{safe}")
+    with c2:
+        st.download_button("⬇ Summary CSV", df_to_bytes(summary_df),
+                           f"STPSUMMARY_{safe}.csv", "text/csv",
+                           key=f"dl_s_{safe}")
+    with c3:
+        st.download_button("⬇ Diff CSV", df_to_bytes(diff_df),
+                           f"STPDIFF_{safe}.csv", "text/csv",
+                           key=f"dl_d_{safe}")
+
+    # Return data for PPT
+    summary_rows = [
+        {
+            "priority":   r["Priority"],
+            "current":    int(r["Current"]),
+            "stp":        int(r["STP"]),
+            "change":     int(r["Change"]),
+            "change_pct": float(r["Change %"]),
+        }
+        for _, r in summary_df.iterrows()
+    ]
+
+    return {
+        "name":           platform_label,
+        "current_gating": gating_before,
+        "stp_gating":     gating_after,
+        "total_current":  total,
+        "device_count":   len(device_cases),
+        "ui_edge_count":  len(ui_changed),
+        "summary":        summary_rows,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
+def main():
+    st.set_page_config(
+        page_title="STP — Semantic Test Prioritization",
+        layout="wide",
+        page_icon="🎯",
+    )
+
+    st.title("🎯 Semantic Test Prioritization (STP)")
+    st.caption(
+        "Platform-aware priority rebalancing. "
+        "UI/cosmetic edge cases → Low. Device-specific cases flagged (priority unchanged)."
+    )
+
+    with st.sidebar:
+        st.header("How it works")
+        st.markdown("""
+**Priority decision (in order):**
+1. UI cosmetic edge case? → **Low**
+2. Core broken (crash/freeze/cannot)? → **Gating**
+3. Core feature (send/call/login)? → **High**
+4. Secondary UX (search/list/settings)? → **Medium**
+5. Otherwise → **Low**
+
+**Platform detection:**
+Automatically detects Android / iOS / Both from scenario text — no manual selection needed.
+
+**Device-specific:**
+Flagged for visibility — priority NOT changed.
+QA team can review these separately.
+
+**UI edge cases → Low:**
+Misalignment, wrong color, icon position,
+text overlap, layout glitch, typo, etc.
+Only if no functional failure is present.
+        """)
+        st.divider()
+        st.caption("Deterministic — same CSV, same result every time.")
+
+    # ── Upload ─────────────────────────────────────────────
+    st.subheader("Upload CSV files")
+    col_a, col_i = st.columns(2)
+    with col_a:
+        android_file = st.file_uploader("🤖 Android CSV", type=["csv"], key="android")
+    with col_i:
+        ios_file = st.file_uploader("🍎 iOS CSV", type=["csv"], key="ios")
+
+    if not android_file and not ios_file:
+        st.info("Upload at least one CSV (Android or iOS) to get started.")
+        st.stop()
+
+    if not st.button("▶  Run STP Analysis", type="primary"):
+        st.stop()
+
+    all_results = []
+
+    if android_file:
+        st.divider()
+        result = process_file(android_file, "Android")
+        if result:
+            all_results.append(result)
+
+    if ios_file:
+        st.divider()
+        result = process_file(ios_file, "iOS")
+        if result:
+            all_results.append(result)
+
+    # ── Executive PPT ──────────────────────────────────────
+    if all_results:
+        st.divider()
+        st.subheader("📊 Executive Report PPT")
+        with st.spinner("Building PPT…"):
+            ppt_bytes = build_executive_ppt(all_results)
+        if ppt_bytes:
+            st.success("Ready!")
+            st.download_button(
+                "⬇ Download STPEXECUTIVEREPORT.pptx",
+                data=ppt_bytes,
+                file_name="STPEXECUTIVEREPORT.pptx",
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                type="primary",
+            )
+
+
+if __name__ == "__main__":
+    main()

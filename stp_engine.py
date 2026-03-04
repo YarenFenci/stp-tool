@@ -288,20 +288,14 @@ def decide_priority(
     elif contains_any(text, medium_terms): base = "Medium"
     else:                                  base = "Low"
 
-    # 2 — device-specific check
+    # 2 — device-specific detection (informational only, priority unchanged)
     is_device, scope = detect_device_scope(text)
 
-    if not is_device:
-        return base, False, "", REASON_MAP.get(base, "Edge validation")
+    reason = REASON_MAP.get(base, "Edge validation")
+    if is_device:
+        reason = f"{reason} — device-specific [{scope}]"
 
-    # 3 — downgrade (with crash exception)
-    if base == "Gating" and is_hard_crash(text) and DEVICE_CRASH_STAYS_GATING:
-        reason = f"{REASON_MAP['Gating']} — device-specific [{scope}] but crash kept Gating"
-        return "Gating", True, scope, reason
-
-    final  = PRIORITY_FROM_RANK[min(PRIORITY_RANK.get(base, 3) + 1, 3)]
-    reason = f"{REASON_MAP.get(final, 'Edge validation')} — device-specific downgrade [{scope}]"
-    return final, True, scope, reason
+    return base, is_device, scope, reason
 
 
 # ─────────────────────────────────────────────────────────────

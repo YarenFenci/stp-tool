@@ -1,391 +1,558 @@
 """
-STP Streamlit App — single CSV, smart priority assignment.
+STP Manual Analyzer — scenario-based QA priority assignment.
+Single scenario input → instant priority with reasoning.
 """
 
-import io
-import json
-import os
-import subprocess
 import sys
-import tempfile
+import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Tuple
 
 import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent))
-from stp_engine import run_stp, PRIORITY_ORDER
+from stp_engine import (
+    decide_priority,
+    detect_device_os_scope,
+    PRIORITY_ORDER,
+    REASON_MAP,
+)
 
-BUILD_PPT_SCRIPT = str(Path(__file__).parent / "build_ppt.js")
-
-PRIORITY_COLOR = {
-    "Gating": "#E53935",
-    "High":   "#FB8C00",
-    "Medium": "#1E88E5",
-    "Low":    "#43A047",
+# ─────────────────────────────────────────────
+# Priority styling
+# ─────────────────────────────────────────────
+PRIORITY_META = {
+    "Gating": {
+        "color":  "#E53935",
+        "bg":     "#FFF0F0",
+        "border": "#FFCDD2",
+        "icon":   "🔴",
+        "label":  "GATING",
+        "desc":   "Blocks release — must fix before any testing continues.",
+    },
+    "High": {
+        "color":  "#FB8C00",
+        "bg":     "#FFF8F0",
+        "border": "#FFE0B2",
+        "icon":   "🟠",
+        "label":  "HIGH",
+        "desc":   "Core feature defect — affects primary user flow.",
+    },
+    "Medium": {
+        "color":  "#1E88E5",
+        "bg":     "#F0F6FF",
+        "border": "#BBDEFB",
+        "icon":   "🔵",
+        "label":  "MEDIUM",
+        "desc":   "Secondary UX issue — non-blocking but should be fixed.",
+    },
+    "Low": {
+        "color":  "#43A047",
+        "bg":     "#F0FFF0",
+        "border": "#C8E6C9",
+        "icon":   "🟢",
+        "label":  "LOW",
+        "desc":   "Cosmetic or minor edge case — no functional impact.",
+    },
 }
 
-SCOPE_COLOR = {
-    "Device":               "#FF6F00",
-    "Os Version":           "#7B1FA2",
-    "Chipset":              "#C62828",
-    "Single Device Repro":  "#AD1457",
-    "":                     "#888888",
+SCOPE_META = {
+    "device":              {"label": "Device Specific",       "color": "#FF6F00"},
+    "os_version":          {"label": "OS Version Specific",   "color": "#7B1FA2"},
+    "chipset":             {"label": "Chipset Specific",      "color": "#C62828"},
+    "single_device_repro": {"label": "Single Device Repro",   "color": "#AD1457"},
 }
 
-
-# ─────────────────────────────────────────────────────────────
-# PPT
-# ─────────────────────────────────────────────────────────────
-def build_ppt(result: Dict) -> Optional[bytes]:
-    payload = json.dumps({"result": result})
-    with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as f:
-        out_path = f.name
-    try:
-        r = subprocess.run(
-            ["node", BUILD_PPT_SCRIPT, payload, out_path],
-            capture_output=True, text=True, timeout=60,
-        )
-        if r.returncode != 0 or not os.path.exists(out_path):
-            st.error(f"PPT build failed:\n{r.stderr}")
-            return None
-        with open(out_path, "rb") as f:
-            return f.read()
-    except Exception as e:
-        st.error(f"PPT error: {e}")
-        return None
-    finally:
-        if os.path.exists(out_path):
-            os.unlink(out_path)
+# ─────────────────────────────────────────────
+# Session state
+# ─────────────────────────────────────────────
+if "history" not in st.session_state:
+    st.session_state.history = []
 
 
-def df_to_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
-    df.to_csv(buf, index=False, encoding="utf-8-sig")
-    return buf.getvalue()
+# ─────────────────────────────────────────────
+# Custom CSS
+# ─────────────────────────────────────────────
+def inject_css():
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
 
-
-# ─────────────────────────────────────────────────────────────
-# Render helpers
-# ─────────────────────────────────────────────────────────────
-def pri_badge(p: str) -> str:
-    c = PRIORITY_COLOR.get(p, "#888")
-    return (f'<span style="background:{c};color:#fff;padding:2px 9px;'
-            f'border-radius:4px;font-size:12px;font-weight:600">{p}</span>')
-
-
-def scope_badge(scope_type: str, scope_detail: str) -> str:
-    if not scope_type:
-        return ""
-    c = SCOPE_COLOR.get(scope_type, "#888")
-    return (f'<span style="background:{c};color:#fff;padding:2px 8px;'
-            f'border-radius:4px;font-size:11px;font-weight:500">'
-            f'{scope_type}: {scope_detail}</span>')
-
-
-def render_summary_table(summary_df: pd.DataFrame):
-    rows_html = ""
-    for _, row in summary_df.iterrows():
-        pr    = row["Priority"]
-        color = PRIORITY_COLOR.get(pr, "#888")
-        chg   = int(row["Change"])
-        chg_s = f"+{chg}" if chg > 0 else str(chg)
-        c_col = "#E53935" if chg > 0 else "#43A047" if chg < 0 else "#888"
-        rows_html += f"""
-        <tr>
-          <td style="padding:7px 12px">
-            <span style="background:{color};color:#fff;padding:2px 10px;
-            border-radius:4px;font-weight:600;font-size:13px">{pr}</span>
-          </td>
-          <td style="text-align:center;padding:7px;font-size:14px">{int(row['Current'])}</td>
-          <td style="text-align:center;padding:7px;font-size:14px;font-weight:700">{int(row['STP'])}</td>
-          <td style="text-align:center;padding:7px;color:{c_col};font-weight:700;font-size:14px">{chg_s}</td>
-          <td style="text-align:center;padding:7px;color:{c_col};font-size:14px">{row['Change %']}%</td>
-        </tr>"""
-    st.markdown(f"""
-    <table style="width:100%;border-collapse:collapse;margin-bottom:12px">
-      <thead>
-        <tr style="background:#1E2761;color:#fff">
-          <th style="padding:9px 12px;text-align:left">Priority</th>
-          <th style="padding:9px;text-align:center">Current</th>
-          <th style="padding:9px;text-align:center">STP</th>
-          <th style="padding:9px;text-align:center">Change</th>
-          <th style="padding:9px;text-align:center">Change %</th>
-        </tr>
-      </thead>
-      <tbody>{rows_html}</tbody>
-    </table>""", unsafe_allow_html=True)
-
-
-def render_scoped_table(scoped_df: pd.DataFrame):
-    if scoped_df.empty:
-        st.info("No device/OS-specific cases detected.")
-        return
-    rows_html = ""
-    for _, row in scoped_df.iterrows():
-        cur_c  = PRIORITY_COLOR.get(row["Current Priority"], "#888")
-        stp_c  = PRIORITY_COLOR.get(row["STP Priority"], "#888")
-        sc     = SCOPE_COLOR.get(row["Scope Type"], "#888")
-        changed = row["Changed"]
-        arrow  = "↓" if changed else "="
-        a_col  = "#E53935" if changed else "#888"
-        rows_html += f"""
-        <tr>
-          <td style="padding:6px 10px;font-family:monospace;font-size:12px">{row['Issue Key']}</td>
-          <td style="padding:6px 10px;font-size:12px;max-width:260px">{str(row['Summary'])[:80]}{'…' if len(str(row['Summary']))>80 else ''}</td>
-          <td style="padding:6px;text-align:center">
-            <span style="background:{sc};color:#fff;padding:1px 8px;border-radius:3px;font-size:11px">
-              {row['Scope Type']}: {row['Scope Detail']}
-            </span>
-          </td>
-          <td style="padding:6px;text-align:center">
-            <span style="background:{cur_c};color:#fff;padding:1px 7px;border-radius:3px;font-size:11px">{row['Current Priority']}</span>
-          </td>
-          <td style="padding:6px;text-align:center;color:{a_col};font-size:14px;font-weight:700">{arrow}</td>
-          <td style="padding:6px;text-align:center">
-            <span style="background:{stp_c};color:#fff;padding:1px 7px;border-radius:3px;font-size:11px">{row['STP Priority']}</span>
-          </td>
-          <td style="padding:6px;font-size:11px;color:#444;max-width:200px">{str(row['Reason'])[:90]}{'…' if len(str(row['Reason']))>90 else ''}</td>
-        </tr>"""
-    st.markdown(f"""
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
-      <thead>
-        <tr style="background:#7B1FA2;color:#fff">
-          <th style="padding:7px 10px;text-align:left">Issue Key</th>
-          <th style="padding:7px 10px;text-align:left">Summary</th>
-          <th style="padding:7px;text-align:center">Scope</th>
-          <th style="padding:7px;text-align:center">Current</th>
-          <th style="padding:7px;text-align:center"></th>
-          <th style="padding:7px;text-align:center">STP</th>
-          <th style="padding:7px;text-align:left">Reason</th>
-        </tr>
-      </thead>
-      <tbody>{rows_html}</tbody>
-    </table>""", unsafe_allow_html=True)
-
-
-def render_changed_table(diff_df: pd.DataFrame):
-    if diff_df.empty:
-        return
-    rows_html = ""
-    for _, row in diff_df.iterrows():
-        cur_c = PRIORITY_COLOR.get(row["Current Priority"], "#888")
-        stp_c = PRIORITY_COLOR.get(row["STP Priority"], "#888")
-        cur_r = ["Gating","High","Medium","Low"].index(row["Current Priority"]) if row["Current Priority"] in ["Gating","High","Medium","Low"] else 3
-        stp_r = ["Gating","High","Medium","Low"].index(row["STP Priority"]) if row["STP Priority"] in ["Gating","High","Medium","Low"] else 3
-        arrow_col = "#E53935" if stp_r < cur_r else "#43A047"
-        arrow_sym = "↑" if stp_r < cur_r else "↓"
-        rows_html += f"""
-        <tr>
-          <td style="padding:6px 10px;font-family:monospace;font-size:12px">{row['Issue Key']}</td>
-          <td style="padding:6px 10px;font-size:12px;max-width:280px">{str(row['Summary'])[:85]}{'…' if len(str(row['Summary']))>85 else ''}</td>
-          <td style="padding:6px;text-align:center">
-            <span style="background:{cur_c};color:#fff;padding:1px 7px;border-radius:3px;font-size:11px">{row['Current Priority']}</span>
-          </td>
-          <td style="padding:6px;text-align:center;color:{arrow_col};font-size:14px;font-weight:700">{arrow_sym}</td>
-          <td style="padding:6px;text-align:center">
-            <span style="background:{stp_c};color:#fff;padding:1px 7px;border-radius:3px;font-size:11px">{row['STP Priority']}</span>
-          </td>
-          <td style="padding:6px;font-size:11px;color:#444">{str(row['Scope Type']) + ': ' + str(row['Scope Detail']) if row['Scope Type'] else '—'}</td>
-          <td style="padding:6px;font-size:11px;color:#444;max-width:220px">{str(row['Reason'])[:85]}{'…' if len(str(row['Reason']))>85 else ''}</td>
-        </tr>"""
-    st.markdown(f"""
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
-      <thead>
-        <tr style="background:#37474F;color:#fff">
-          <th style="padding:7px 10px;text-align:left">Issue Key</th>
-          <th style="padding:7px 10px;text-align:left">Summary</th>
-          <th style="padding:7px;text-align:center">Current</th>
-          <th style="padding:7px;text-align:center"></th>
-          <th style="padding:7px;text-align:center">STP</th>
-          <th style="padding:7px;text-align:center">Scope</th>
-          <th style="padding:7px;text-align:left">Reason</th>
-        </tr>
-      </thead>
-      <tbody>{rows_html}</tbody>
-    </table>""", unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────
-def main():
-    st.set_page_config(
-        page_title="STP — Semantic Test Prioritization",
-        layout="wide",
-        page_icon="🎯",
-    )
-
-    st.title("🎯 Semantic Test Prioritization (STP)")
-    st.caption(
-        "Scenario-based priority assignment. "
-        "Device/OS-specific cases detected and adjusted separately."
-    )
-
-    with st.sidebar:
-        st.header("Priority Logic")
-        st.markdown("""
-**Decision order:**
-
-🔴 **Gating** — app/feature completely broken  
-crash, freeze, cannot send/call/login, force close
-
-🟠 **High** — core feature defect  
-send message, voice/video call, login, upload
-
-🔵 **Medium** — secondary UX, non-blocking  
-search, list, settings, profile, navigation
-
-🟢 **Low** — cosmetic only, no functional impact  
-misalign, wrong color, typo, icon glitch
-
----
-**Device / OS scope adjustment:**
-
-If scenario is device/OS specific:
-- crash/freeze → stays **Gating** (crash is always Gating)
-- Gating (non-crash) → **High** (not universal blocker)
-- High → **Medium** (scoped to one device/OS)
-- Medium/Low → unchanged, annotated
-
----
-*Deterministic — same CSV, same result.*
-        """)
-
-    # ── Upload ──────────────────────────────────────────────
-    st.subheader("Upload Test Case CSV")
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
-
-    if not uploaded:
-        st.info("Upload a CSV file to get started.")
-        st.stop()
-
-    if not st.button("▶  Run STP Analysis", type="primary"):
-        st.stop()
-
-    # ── Parse & run ─────────────────────────────────────────
-    try:
-        raw = uploaded.getvalue().decode("utf-8", errors="replace")
-        df  = pd.read_csv(io.StringIO(raw), sep=None, engine="python", on_bad_lines="skip")
-    except Exception as e:
-        st.error(f"Could not read CSV: {e}")
-        st.stop()
-
-    try:
-        analysis_df, summary_df, diff_df = run_stp(df)
-    except ValueError as e:
-        st.error(str(e))
-        st.stop()
-
-    total        = len(analysis_df)
-    changed      = int(analysis_df["Changed"].sum())
-    scoped_cases = analysis_df[analysis_df["Scoped"] == "Yes"]
-    gat_before   = int(summary_df.loc[summary_df["Priority"] == "Gating", "Current"].iloc[0])
-    gat_after    = int(summary_df.loc[summary_df["Priority"] == "Gating", "STP"].iloc[0])
-    reduction    = gat_before - gat_after
-
-    # ── KPIs ────────────────────────────────────────────────
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total cases",       total)
-    k2.metric("Priority changed",  changed,
-              delta=f"{round(changed/total*100,1)}%" if total else None)
-    k3.metric("Gating before",     gat_before)
-    k4.metric("Gating after",      gat_after,
-              delta=f"−{reduction}" if reduction > 0 else str(reduction),
-              delta_color="inverse")
-    k5.metric("Device/OS scoped",  len(scoped_cases), delta_color="off")
-
-    # ── Summary ─────────────────────────────────────────────
-    st.markdown("### Priority Summary")
-    render_summary_table(summary_df)
-
-    # ── Scoped cases ────────────────────────────────────────
-    if not scoped_cases.empty:
-        scoped_changed = scoped_cases[scoped_cases["Changed"]]
-        with st.expander(
-            f"📱 Device / OS Specific Cases — {len(scoped_cases)} total, "
-            f"{len(scoped_changed)} priority adjusted",
-            expanded=True,
-        ):
-            render_scoped_table(
-                scoped_cases[[
-                    "Issue Key", "Summary", "Scope Type", "Scope Detail",
-                    "Current Priority", "STP Priority", "Changed", "Reason"
-                ]]
-            )
-
-    # ── All changed ─────────────────────────────────────────
-    if not diff_df.empty:
-        with st.expander(f"All priority changes ({len(diff_df)})", expanded=False):
-            render_changed_table(
-                diff_df[[
-                    "Issue Key", "Summary", "Current Priority", "STP Priority",
-                    "Scope Type", "Scope Detail", "Reason"
-                ]]
-            )
-
-    # ── Full table ──────────────────────────────────────────
-    with st.expander("Full analysis table", expanded=False):
-        show = ["Issue Key", "Summary", "Current Priority", "STP Priority",
-                "Scoped", "Scope Type", "Scope Detail", "Changed", "Reason"]
-        st.dataframe(analysis_df[show], use_container_width=True, hide_index=True)
-
-    # ── Downloads ───────────────────────────────────────────
-    st.divider()
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.download_button("⬇ Analysis CSV", df_to_bytes(analysis_df),
-                           "STPANALYSIS.csv", "text/csv")
-    with c2:
-        st.download_button("⬇ Summary CSV", df_to_bytes(summary_df),
-                           "STPSUMMARY.csv", "text/csv")
-    with c3:
-        st.download_button("⬇ Diff CSV", df_to_bytes(diff_df),
-                           "STPDIFF.csv", "text/csv")
-
-    # ── PPT ─────────────────────────────────────────────────
-    st.divider()
-    st.subheader("📊 Executive Report PPT")
-
-    summary_rows = [
-        {
-            "priority":   r["Priority"],
-            "current":    int(r["Current"]),
-            "stp":        int(r["STP"]),
-            "change":     int(r["Change"]),
-            "change_pct": float(r["Change %"]),
-        }
-        for _, r in summary_df.iterrows()
-    ]
-
-    # Scope breakdown for PPT
-    scope_counts = scoped_cases["Scope Type"].value_counts().to_dict() if not scoped_cases.empty else {}
-    scoped_changed_count = int(scoped_cases["Changed"].sum()) if not scoped_cases.empty else 0
-
-    ppt_payload = {
-        "total":               total,
-        "changed":             changed,
-        "gating_before":       gat_before,
-        "gating_after":        gat_after,
-        "scoped_count":        len(scoped_cases),
-        "scoped_changed":      scoped_changed_count,
-        "scope_breakdown":     scope_counts,
-        "summary":             summary_rows,
+    html, body, [class*="css"] {
+        font-family: 'DM Sans', sans-serif;
     }
 
-    with st.spinner("Building PPT…"):
-        ppt_bytes = build_ppt(ppt_payload)
+    .stApp {
+        background: #0A0E1A;
+    }
 
-    if ppt_bytes:
-        st.success("Ready!")
-        st.download_button(
-            "⬇ Download STPEXECUTIVEREPORT.pptx",
-            data=ppt_bytes,
-            file_name="STPEXECUTIVEREPORT.pptx",
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            type="primary",
+    /* Header */
+    .stp-header {
+        padding: 2.5rem 0 1.5rem 0;
+        margin-bottom: 0.5rem;
+    }
+    .stp-title {
+        font-family: 'Syne', sans-serif;
+        font-size: 2.4rem;
+        font-weight: 800;
+        color: #F0F4FF;
+        letter-spacing: -0.03em;
+        line-height: 1.1;
+        margin: 0;
+    }
+    .stp-title span {
+        color: #4FC3F7;
+    }
+    .stp-subtitle {
+        font-family: 'DM Sans', sans-serif;
+        font-size: 0.9rem;
+        color: #6B7A99;
+        margin-top: 0.4rem;
+        letter-spacing: 0.02em;
+    }
+    .stp-divider {
+        height: 1px;
+        background: linear-gradient(90deg, #4FC3F7 0%, #1E2761 60%, transparent 100%);
+        margin: 1rem 0 1.5rem 0;
+    }
+
+    /* Form panel */
+    .form-panel {
+        background: #111827;
+        border: 1px solid #1E2761;
+        border-radius: 12px;
+        padding: 1.5rem;
+    }
+    .form-label {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.7rem;
+        font-weight: 600;
+        color: #4FC3F7;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        margin-bottom: 0.4rem;
+    }
+
+    /* Streamlit input overrides */
+    .stTextInput input, .stTextArea textarea {
+        background: #0D1321 !important;
+        border: 1px solid #1E2761 !important;
+        border-radius: 8px !important;
+        color: #E8EEFF !important;
+        font-family: 'DM Sans', sans-serif !important;
+        font-size: 0.88rem !important;
+    }
+    .stTextInput input:focus, .stTextArea textarea:focus {
+        border-color: #4FC3F7 !important;
+        box-shadow: 0 0 0 2px rgba(79,195,247,0.12) !important;
+    }
+    .stTextInput input::placeholder, .stTextArea textarea::placeholder {
+        color: #3A4A6B !important;
+    }
+
+    /* Button */
+    .stButton > button {
+        background: linear-gradient(135deg, #1565C0, #0D47A1) !important;
+        color: #E8F5FF !important;
+        border: none !important;
+        border-radius: 8px !important;
+        font-family: 'Syne', sans-serif !important;
+        font-weight: 700 !important;
+        font-size: 0.9rem !important;
+        letter-spacing: 0.04em !important;
+        padding: 0.6rem 1.5rem !important;
+        width: 100% !important;
+        transition: all 0.2s ease !important;
+    }
+    .stButton > button:hover {
+        background: linear-gradient(135deg, #1976D2, #1565C0) !important;
+        transform: translateY(-1px) !important;
+        box-shadow: 0 4px 20px rgba(21,101,192,0.4) !important;
+    }
+
+    /* Result card */
+    .result-card {
+        border-radius: 12px;
+        padding: 1.6rem;
+        margin-bottom: 1rem;
+        border: 1px solid;
+    }
+    .result-priority-label {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.65rem;
+        font-weight: 600;
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+        margin-bottom: 0.3rem;
+    }
+    .result-priority-value {
+        font-family: 'Syne', sans-serif;
+        font-size: 2.2rem;
+        font-weight: 800;
+        letter-spacing: -0.02em;
+        line-height: 1;
+        margin-bottom: 0.5rem;
+    }
+    .result-desc {
+        font-size: 0.82rem;
+        opacity: 0.75;
+        line-height: 1.4;
+    }
+
+    /* Device badge */
+    .device-badge {
+        display: inline-block;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.68rem;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        margin-top: 0.8rem;
+    }
+
+    /* Reason box */
+    .reason-box {
+        background: #0D1321;
+        border: 1px solid #1E2761;
+        border-left: 3px solid #4FC3F7;
+        border-radius: 8px;
+        padding: 1rem 1.2rem;
+        margin-top: 1rem;
+    }
+    .reason-title {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.65rem;
+        color: #4FC3F7;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        margin-bottom: 0.5rem;
+    }
+    .reason-text {
+        font-size: 0.85rem;
+        color: #C8D4F0;
+        line-height: 1.6;
+    }
+
+    /* Keyword hits */
+    .keyword-box {
+        background: #0D1321;
+        border: 1px solid #1E2761;
+        border-radius: 8px;
+        padding: 0.8rem 1.1rem;
+        margin-top: 0.8rem;
+    }
+    .kw-chip {
+        display: inline-block;
+        background: #1A2340;
+        border: 1px solid #2A3560;
+        border-radius: 4px;
+        padding: 2px 8px;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.68rem;
+        color: #8BA7D9;
+        margin: 2px 3px;
+    }
+
+    /* History table */
+    .hist-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0.6rem 0.8rem;
+        border-radius: 6px;
+        background: #111827;
+        border: 1px solid #1A2340;
+        margin-bottom: 6px;
+        font-size: 0.82rem;
+    }
+    .hist-key {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.7rem;
+        color: #4FC3F7;
+        min-width: 36px;
+    }
+    .hist-summary {
+        flex: 1;
+        color: #A0B0CC;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .hist-badge {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.68rem;
+        font-weight: 700;
+        padding: 2px 9px;
+        border-radius: 4px;
+        color: #fff;
+        white-space: nowrap;
+    }
+    .hist-device {
+        font-size: 0.68rem;
+        color: #FF6F00;
+        font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background: #0D1321 !important;
+        border-right: 1px solid #1E2761 !important;
+    }
+    section[data-testid="stSidebar"] * {
+        color: #8BA7D9 !important;
+    }
+
+    /* Hide Streamlit chrome */
+    #MainMenu, footer, header { visibility: hidden; }
+    .block-container { padding-top: 1rem !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+# Keyword hit detection (for transparency)
+# ─────────────────────────────────────────────
+from stp_engine import (
+    GATING_TERMS, HIGH_TERMS, MEDIUM_TERMS,
+    LOW_COSMETIC_TERMS, HARD_CRASH_TERMS,
+)
+
+def find_hit_keywords(text: str, priority: str) -> List[str]:
+    t = text.lower()
+    if priority == "Gating":
+        pool = GATING_TERMS
+    elif priority == "High":
+        pool = HIGH_TERMS
+    elif priority == "Medium":
+        pool = MEDIUM_TERMS
+    else:
+        pool = LOW_COSMETIC_TERMS + ["(no strong signal — default low)"]
+    return [kw for kw in pool if kw and kw in t][:8]
+
+
+# ─────────────────────────────────────────────
+# Render result
+# ─────────────────────────────────────────────
+def render_result(summary: str, steps: str, expected: str):
+    text = (summary + " " + steps + " " + expected).lower()
+    priority, is_scoped, scope_type, scope_detail, reason = decide_priority(text)
+    meta   = PRIORITY_META[priority]
+    hits   = find_hit_keywords(text, priority)
+
+    # Result card
+    st.markdown(f"""
+    <div class="result-card" style="
+        background:{meta['bg']};
+        border-color:{meta['border']};
+    ">
+        <div class="result-priority-label" style="color:{meta['color']}">
+            STP PRIORITY
+        </div>
+        <div class="result-priority-value" style="color:{meta['color']}">
+            {meta['icon']} {meta['label']}
+        </div>
+        <div class="result-desc" style="color:{meta['color']}">
+            {meta['desc']}
+        </div>
+        {"" if not is_scoped else f'''
+        <div class="device-badge" style="
+            background:{SCOPE_META.get(scope_type,{}).get('color','#FF6F00')}22;
+            border:1px solid {SCOPE_META.get(scope_type,{}).get('color','#FF6F00')}66;
+            color:{SCOPE_META.get(scope_type,{}).get('color','#FF6F00')};
+        ">
+            ⚠ {SCOPE_META.get(scope_type,{}).get('label','Device Specific')}: {scope_detail}
+            &nbsp;·&nbsp; priority adjusted accordingly
+        </div>
+        '''}
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Reason
+    st.markdown(f"""
+    <div class="reason-box">
+        <div class="reason-title">Why this priority</div>
+        <div class="reason-text">{reason}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Keyword hits
+    if hits:
+        chips = "".join(f'<span class="kw-chip">{kw}</span>' for kw in hits)
+        st.markdown(f"""
+        <div class="keyword-box">
+            <div class="reason-title" style="margin-bottom:0.4rem">
+                Matched signals
+            </div>
+            {chips}
+        </div>
+        """, unsafe_allow_html=True)
+
+    return priority, is_scoped, scope_type, scope_detail
+
+
+# ─────────────────────────────────────────────
+# History row
+# ─────────────────────────────────────────────
+def render_history():
+    if not st.session_state.history:
+        return
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(
+        '<div class="form-label" style="color:#6B7A99;margin-bottom:0.6rem">'
+        f'SESSION HISTORY &nbsp;·&nbsp; {len(st.session_state.history)} scenarios'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    for i, entry in enumerate(reversed(st.session_state.history)):
+        meta      = PRIORITY_META[entry["priority"]]
+        dev_html  = (
+            f'<span class="hist-device">⚠ {entry["scope_detail"]}</span>'
+            if entry["is_scoped"] else ""
         )
+        st.markdown(f"""
+        <div class="hist-row">
+            <span class="hist-key">#{len(st.session_state.history)-i}</span>
+            <span class="hist-summary">{entry['summary'][:70]}{'…' if len(entry['summary'])>70 else ''}</span>
+            {dev_html}
+            <span class="hist-badge" style="background:{meta['color']}">{meta['label']}</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # CSV export
+    if len(st.session_state.history) > 0:
+        hist_df = pd.DataFrame(st.session_state.history)[
+            ["summary", "steps", "expected", "priority", "is_scoped", "scope_type", "scope_detail", "reason"]
+        ]
+        hist_df.columns = ["Summary", "Steps", "Expected", "Priority",
+                           "Device Specific", "Scope Type", "Scope Detail", "Reason"]
+        st.download_button(
+            "⬇ Export session as CSV",
+            data=hist_df.to_csv(index=False).encode("utf-8"),
+            file_name="stp_manual_session.csv",
+            mime="text/csv",
+            key="dl_hist",
+        )
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+def main():
+    st.set_page_config(
+        page_title="STP — Priority Analyzer",
+        layout="wide",
+        page_icon="🎯",
+        initial_sidebar_state="collapsed",
+    )
+
+    inject_css()
+
+    # ── Header ──────────────────────────────
+    st.markdown("""
+    <div class="stp-header">
+        <div class="stp-title">STP <span>Priority</span> Analyzer</div>
+        <div class="stp-subtitle">
+            Scenario-based QA priority assignment &nbsp;·&nbsp;
+            Gating · High · Medium · Low &nbsp;·&nbsp;
+            Device/OS scope detection
+        </div>
+    </div>
+    <div class="stp-divider"></div>
+    """, unsafe_allow_html=True)
+
+    # ── Layout ──────────────────────────────
+    left, right = st.columns([1, 1], gap="large")
+
+    with left:
+        st.markdown('<div class="form-label">Scenario Input</div>', unsafe_allow_html=True)
+
+        summary  = st.text_input(
+            "Summary",
+            placeholder="e.g. App crashes when sending voice message on Redmi 10",
+            label_visibility="collapsed",
+            key="inp_summary",
+        )
+        steps = st.text_area(
+            "Steps to Reproduce",
+            placeholder="1. Open chat\n2. Tap voice message\n3. Send\n4. App force closes",
+            height=130,
+            label_visibility="collapsed",
+            key="inp_steps",
+        )
+        expected = st.text_area(
+            "Expected Result",
+            placeholder="Voice message should be sent successfully without crash",
+            height=80,
+            label_visibility="collapsed",
+            key="inp_expected",
+        )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        analyze = st.button("▶  Analyze Priority", key="btn_analyze")
+
+        # Priority legend
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="form-label" style="color:#3A4A6B;margin-bottom:0.6rem">Priority Reference</div>', unsafe_allow_html=True)
+        for p, m in PRIORITY_META.items():
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">'
+                f'<span style="width:10px;height:10px;border-radius:50%;background:{m["color"]};display:inline-block;flex-shrink:0"></span>'
+                f'<span style="font-family:\'JetBrains Mono\',monospace;font-size:0.7rem;color:{m["color"]};font-weight:600;min-width:56px">{p}</span>'
+                f'<span style="font-size:0.78rem;color:#3A4A6B">{m["desc"]}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    with right:
+        if analyze:
+            if not summary.strip():
+                st.warning("Please enter at least a summary.")
+            else:
+                priority, is_scoped, scope_type, scope_detail = render_result(
+                    summary, steps, expected
+                )
+                text   = (summary + " " + steps + " " + expected).lower()
+                _, _, _, _, reason = decide_priority(text)
+
+                st.session_state.history.append({
+                    "summary":      summary,
+                    "steps":        steps,
+                    "expected":     expected,
+                    "priority":     priority,
+                    "is_scoped":    is_scoped,
+                    "scope_type":   scope_type,
+                    "scope_detail": scope_detail,
+                    "reason":       reason,
+                })
+        else:
+            # Placeholder
+            st.markdown("""
+            <div style="
+                height:220px;
+                border:1px dashed #1E2761;
+                border-radius:12px;
+                display:flex;
+                flex-direction:column;
+                align-items:center;
+                justify-content:center;
+                color:#2A3A5C;
+                font-family:'JetBrains Mono',monospace;
+                font-size:0.8rem;
+                letter-spacing:0.06em;
+                gap:8px;
+            ">
+                <div style="font-size:2rem">🎯</div>
+                <div>PRIORITY RESULT WILL APPEAR HERE</div>
+                <div style="font-size:0.68rem;opacity:0.5">Fill in the scenario and click Analyze</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    # ── History ─────────────────────────────
+    render_history()
 
 
 if __name__ == "__main__":

@@ -225,22 +225,22 @@ def detect_device_os_scope(text: str) -> Tuple[bool, str, str]:
 # ─────────────────────────────────────────────────────────────
 REASON_MAP = {
     "Gating": (
-        "Bu hata, BiP'in temel fonksiyonlarından birini (mesajlaşma, arama, giriş) "
-        "tamamen çalışamaz hale getiriyor veya sürekli reproduce edilebilen bir crash içeriyor. "
-        "Yük çıkmadan önce mutlaka çözülmesi gerekiyor."
+        "This bug makes one of BiP's core functions (messaging, calling, login) completely unusable, "
+        "or contains a consistently reproducible crash. "
+        "Must be resolved before the release can ship."
     ),
     "High": (
-        "Önemli bir özellik etkilenmiş ancak uygulama tamamen kullanılamaz değil. "
-        "Temel akışı zorlaştırıyor, 2 hafta içinde çözülmeli. "
-        "PO ve QA Lead değerlendirmesi ile yük çıkış kararı verilebilir."
+        "An important feature is affected but the app is not entirely unusable. "
+        "The main flow is impaired — fix within 2 weeks. "
+        "PO and QA Lead must evaluate whether the release can ship as-is."
     ),
     "Medium": (
-        "İkincil bir fonksiyon veya UX sorunu. Kullanıcıyı engelliyor ancak "
-        "workaround mevcut ya da çok sık kullanılan bir akış değil. 6 hafta içinde çözülmeli."
+        "A secondary function or UX issue. The user is impacted but a workaround exists "
+        "or this is not a high-frequency flow. Fix within 6 weeks."
     ),
     "Low": (
-        "Kozmetik veya küçük edge case sorunu. Fonksiyonel etki yok, "
-        "kullanıcı deneyimini önemli ölçüde etkilemiyor. Son öncelik."
+        "Cosmetic or minor edge case. No functional impact — "
+        "does not meaningfully affect user experience. Lowest priority."
     ),
 }
 
@@ -312,13 +312,13 @@ def decide_priority(
         if idx < len(PRIORITY_ORDER) - 1:
             priority = PRIORITY_ORDER[idx + 1]
             reason += (
-                f" ⚠ Cihaz özelinde ({scope_detail}) reproduce ediliyor — "
-                f"priority bir seviye düşürüldü. Farklı cihazlarda doğrulanırsa yükseltilmeli."
+                f" ⚠ Reproduced only on specific device ({scope_detail}) — "
+                f"priority lowered by one level. Should be escalated if confirmed on other devices."
             )
     elif is_scoped and scope_type == "os_version":
         reason += (
-            f" ⚠ OS versiyonu ({scope_detail}) özelinde görülüyor — "
-            f"etki alanı sınırlı, ancak ilgili OS'ta yaygın kullanım varsa dikkat."
+            f" ⚠ Seen only on OS version ({scope_detail}) — "
+            f"limited impact, but worth monitoring if that OS version has wide adoption."
         )
 
     return priority, is_scoped, scope_type, scope_detail, reason

@@ -31,7 +31,7 @@ PRIORITY_META = {
         "border": "#FFCDD2",
         "icon":   "🔴",
         "label":  "GATING",
-        "desc":   "Yük çıkmadan önce çözülmeli — temel fonksiyon bozuk veya reproducible crash.",
+        "desc":   "Blocks release — core function broken or reproducible crash. Must fix before shipping.",
     },
     "High": {
         "color":  "#FB8C00",
@@ -39,7 +39,7 @@ PRIORITY_META = {
         "border": "#FFE0B2",
         "icon":   "🟠",
         "label":  "HIGH",
-        "desc":   "Önemli özellik etkilenmiş — 2 hafta içinde çözülmeli, PO/QA Lead kararı gerekir.",
+        "desc":   "Important feature affected — fix within 2 weeks. PO/QA Lead decision required to ship.",
     },
     "Medium": {
         "color":  "#1E88E5",
@@ -47,7 +47,7 @@ PRIORITY_META = {
         "border": "#BBDEFB",
         "icon":   "🔵",
         "label":  "MEDIUM",
-        "desc":   "İkincil UX sorunu — workaround var, 6 hafta içinde çözülmeli.",
+        "desc":   "Secondary UX issue — workaround exists, fix within 6 weeks.",
     },
     "Low": {
         "color":  "#43A047",
@@ -55,15 +55,15 @@ PRIORITY_META = {
         "border": "#C8E6C9",
         "icon":   "🟢",
         "label":  "LOW",
-        "desc":   "Kozmetik / küçük edge case — fonksiyonel etkisi yok.",
+        "desc":   "Cosmetic / minor edge case — no functional impact.",
     },
 }
 
 SCOPE_META = {
-    "device":              {"label": "Cihaz Özelinde",       "color": "#FF6F00"},
-    "os_version":          {"label": "OS Versiyonu Özelinde", "color": "#7B1FA2"},
-    "chipset":             {"label": "Chipset Özelinde",      "color": "#C62828"},
-    "single_device_repro": {"label": "Tek Cihazda Repro",    "color": "#AD1457"},
+    "device":              {"label": "Device Specific",       "color": "#FF6F00"},
+    "os_version":          {"label": "OS Version Specific",   "color": "#7B1FA2"},
+    "chipset":             {"label": "Chipset Specific",      "color": "#C62828"},
+    "single_device_repro": {"label": "Single Device Repro",   "color": "#AD1457"},
 }
 
 # ─────────────────────────────────────────────
@@ -239,7 +239,7 @@ def render_result(summary: str, steps: str, actual: str, expected: str):
             border:1px solid {SCOPE_META.get(scope_type,{}).get('color','#FF6F00')}66;
             color:{SCOPE_META.get(scope_type,{}).get('color','#FF6F00')};
         ">
-            ⚠ {SCOPE_META.get(scope_type,{}).get('label','Cihaz Özelinde')}: {scope_detail}
+            ⚠ {SCOPE_META.get(scope_type,{}).get('label','Device Specific')}: {scope_detail}
         </div>
         '''}
     </div>
@@ -247,8 +247,8 @@ def render_result(summary: str, steps: str, actual: str, expected: str):
 
     # Actual vs Expected comparison
     if actual.strip() or expected.strip():
-        actual_html = actual.strip() if actual.strip() else "<em style='opacity:0.4'>Belirtilmedi</em>"
-        expected_html = expected.strip() if expected.strip() else "<em style='opacity:0.4'>Belirtilmedi</em>"
+        actual_html = actual.strip() if actual.strip() else "<em style='opacity:0.4'>Not specified</em>"
+        expected_html = expected.strip() if expected.strip() else "<em style='opacity:0.4'>Not specified</em>"
         st.markdown(f"""
         <div class="result-comparison">
             <div class="result-box">
@@ -265,7 +265,7 @@ def render_result(summary: str, steps: str, actual: str, expected: str):
     # Reason
     st.markdown(f"""
     <div class="reason-box">
-        <div class="reason-title">Neden bu priority?</div>
+        <div class="reason-title">Why this priority?</div>
         <div class="reason-text">{reason}</div>
     </div>
     """, unsafe_allow_html=True)
@@ -275,7 +275,7 @@ def render_result(summary: str, steps: str, actual: str, expected: str):
         chips = "".join(f'<span class="kw-chip">{kw}</span>' for kw in hits)
         st.markdown(f"""
         <div class="keyword-box">
-            <div class="reason-title" style="margin-bottom:0.4rem">Eşleşen sinyaller</div>
+            <div class="reason-title" style="margin-bottom:0.4rem">Matched signals</div>
             {chips}
         </div>
         """, unsafe_allow_html=True)
@@ -293,7 +293,7 @@ def render_history():
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown(
         f'<div class="form-label" style="color:#6B7A99;margin-bottom:0.6rem">'
-        f'OTURUM GEÇMİŞİ &nbsp;·&nbsp; {len(st.session_state.history)} senaryo</div>',
+        f'SESSION HISTORY &nbsp;·&nbsp; {len(st.session_state.history)} scenarios</div>',
         unsafe_allow_html=True,
     )
 
@@ -322,7 +322,7 @@ def render_history():
             "Priority", "Device Specific", "Scope Type", "Scope Detail", "Reason"
         ]
         st.download_button(
-            "⬇ CSV olarak dışa aktar",
+            "⬇ Export session as CSV",
             data=hist_df.to_csv(index=False).encode("utf-8"),
             file_name="stp_session.csv",
             mime="text/csv",
@@ -347,9 +347,9 @@ def main():
     <div class="stp-header">
         <div class="stp-title">STP <span>Priority</span> Analyzer</div>
         <div class="stp-subtitle">
-            BiP QA · Senaryo bazlı öncelik atama &nbsp;·&nbsp;
+            BiP QA · Scenario-based priority assignment &nbsp;·&nbsp;
             Gating · High · Medium · Low &nbsp;·&nbsp;
-            Cihaz / OS scope tespiti
+            Device / OS scope detection
         </div>
     </div>
     <div class="stp-divider"></div>
@@ -358,31 +358,31 @@ def main():
     left, right = st.columns([1, 1], gap="large")
 
     with left:
-        st.markdown('<div class="form-label">Senaryo Girişi</div>', unsafe_allow_html=True)
+        st.markdown('<div class="form-label">Scenario Input</div>', unsafe_allow_html=True)
 
         summary = st.text_input(
             "Summary",
-            placeholder="Örn: Sesli mesaj gönderirken uygulama crash oluyor (Redmi 10)",
+            placeholder="e.g. App crashes while sending voice message (Redmi 10)",
             label_visibility="collapsed",
             key="inp_summary",
         )
 
-        st.markdown('<div class="section-label">Adımlar</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">Steps to Reproduce</div>', unsafe_allow_html=True)
         steps = st.text_area(
             "Steps",
-            placeholder="1. Sohbeti aç\n2. Sesli mesaj ikonuna bas\n3. Kaydet ve gönder\n4. Uygulama kapanıyor",
+            placeholder="1. Open chat\n2. Tap voice message icon\n3. Record and send\n4. App force closes",
             height=110,
             label_visibility="collapsed",
             key="inp_steps",
         )
 
-        # Actual / Expected Result — yan yana
+        # Actual / Expected Result — side by side
         col_a, col_e = st.columns(2)
         with col_a:
             st.markdown('<div class="section-label">🔴 Actual Result</div>', unsafe_allow_html=True)
             actual = st.text_area(
                 "Actual",
-                placeholder="Ne oluyor?\nÖrn: Uygulama force close ile kapanıyor",
+                placeholder="What happens?\ne.g. App force closes immediately",
                 height=100,
                 label_visibility="collapsed",
                 key="inp_actual",
@@ -391,18 +391,18 @@ def main():
             st.markdown('<div class="section-label">🟢 Expected Result</div>', unsafe_allow_html=True)
             expected = st.text_area(
                 "Expected",
-                placeholder="Ne olmalıydı?\nÖrn: Sesli mesaj başarıyla gönderilmeli",
+                placeholder="What should happen?\ne.g. Voice message sent successfully",
                 height=100,
                 label_visibility="collapsed",
                 key="inp_expected",
             )
 
         st.markdown("<br>", unsafe_allow_html=True)
-        analyze = st.button("▶  Priority Analiz Et", key="btn_analyze")
+        analyze = st.button("▶  Analyze Priority", key="btn_analyze")
 
         # Priority legend
         st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<div class="form-label" style="color:#3A4A6B;margin-bottom:0.6rem">Priority Referans</div>', unsafe_allow_html=True)
+        st.markdown('<div class="form-label" style="color:#3A4A6B;margin-bottom:0.6rem">Priority Reference</div>', unsafe_allow_html=True)
         for p, m in PRIORITY_META.items():
             st.markdown(
                 f'<div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:6px">'
@@ -420,14 +420,14 @@ def main():
                     border-radius:8px;padding:0.8rem 1rem;margin-top:1rem">
             <div style="font-family:'JetBrains Mono',monospace;font-size:0.6rem;color:#E53935;
                         letter-spacing:0.1em;text-transform:uppercase;margin-bottom:0.4rem">
-                Gating Kriterleri (BiP)
+                Gating Criteria (BiP)
             </div>
             <div style="font-size:0.76rem;color:#6B7A99;line-height:1.7">
-                • Mesajlaşma / arama / giriş tamamen çalışmıyor<br>
-                • Her zaman veya belirli senaryo ile crash<br>
-                • Fraud / maddi kayıp riski<br>
-                • Kalıcı veri kaybı<br>
-                • Story / group gibi her yerde crash değil, sadece core akış
+                • Messaging / calling / login completely broken<br>
+                • Always or scenario-specific reproducible crash<br>
+                • Fraud / financial loss risk<br>
+                • Permanent data loss<br>
+                • Only core flow — not every minor crash is Gating
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -435,7 +435,7 @@ def main():
     with right:
         if analyze:
             if not summary.strip():
-                st.warning("Lütfen en azından bir summary girin.")
+                st.warning("Please enter at least a summary.")
             else:
                 priority, is_scoped, scope_type, scope_detail, reason = render_result(
                     summary, steps, actual, expected
@@ -460,12 +460,16 @@ def main():
                 letter-spacing:0.06em; gap:8px;
             ">
                 <div style="font-size:2rem">🎯</div>
-                <div>PRIORITY SONUCU BURADA GÖRÜNECEK</div>
-                <div style="font-size:0.68rem;opacity:0.5">Senaryoyu doldurun ve analiz edin</div>
+                <div>PRIORITY RESULT WILL APPEAR HERE</div>
+                <div style="font-size:0.68rem;opacity:0.5">Fill in the scenario and click Analyze</div>
             </div>
             """, unsafe_allow_html=True)
 
     render_history()
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from stp_engine import (
     REASON_MAP,
     GATING_TERMS, HIGH_TERMS, MEDIUM_TERMS,
     LOW_COSMETIC_TERMS, HARD_CRASH_TERMS, FREEZE_TERMS,
+    FREQ_OPTIONS,
 )
 
 # ─────────────────────────────────────────────
@@ -64,6 +65,15 @@ SCOPE_META = {
     "os_version":          {"label": "OS Version Specific",   "color": "#7B1FA2"},
     "chipset":             {"label": "Chipset Specific",      "color": "#C62828"},
     "single_device_repro": {"label": "Single Device Repro",   "color": "#AD1457"},
+    "manual":              {"label": "Device / OS Scope",     "color": "#E65100"},
+}
+
+FREQ_META = {
+    "always":       {"icon": "🔁", "color": "#E53935", "label": "Always"},
+    "frequently":   {"icon": "🔄", "color": "#FB8C00", "label": "Frequently"},
+    "occasionally": {"icon": "🔃", "color": "#1E88E5", "label": "Occasionally"},
+    "rarely":       {"icon": "🔀", "color": "#43A047", "label": "Rarely"},
+    "once":         {"icon": "1️⃣",  "color": "#78909C", "label": "Once"},
 }
 
 # ─────────────────────────────────────────────
@@ -116,6 +126,39 @@ def inject_css():
         border-color: #4FC3F7 !important; box-shadow: 0 0 0 2px rgba(79,195,247,0.12) !important;
     }
     .stTextInput input::placeholder, .stTextArea textarea::placeholder { color: #3A4A6B !important; }
+
+    /* Selectbox styling */
+    .stSelectbox > div > div {
+        background: #0D1321 !important;
+        border: 1px solid #1E2761 !important;
+        border-radius: 8px !important;
+        color: #E8EEFF !important;
+    }
+
+    /* Adjustment note box */
+    .adjust-box {
+        border-radius: 8px;
+        padding: 0.8rem 1rem;
+        margin-top: 0.8rem;
+        border: 1px solid;
+        font-size: 0.82rem;
+        line-height: 1.6;
+    }
+    .adjust-box-label {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.6rem;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        margin-bottom: 0.3rem;
+        font-weight: 600;
+    }
+
+    /* Freq badge */
+    .freq-badge {
+        display: inline-flex; align-items: center; gap: 5px;
+        padding: 3px 10px; border-radius: 12px; margin-top: 0.6rem;
+        font-family: 'JetBrains Mono', monospace; font-size: 0.68rem; font-weight: 600;
+    }
 
     .stButton > button {
         background: linear-gradient(135deg, #1565C0, #0D47A1) !important;
@@ -219,36 +262,71 @@ def find_hit_keywords(text: str, priority: str) -> List[str]:
 # ─────────────────────────────────────────────
 # Render result
 # ─────────────────────────────────────────────
-def render_result(summary: str, steps: str, actual: str, expected: str):
-    base_text = (summary + " " + steps).lower()
-    priority, is_scoped, scope_type, scope_detail, reason = decide_priority(
-        base_text, actual_result=actual, expected_result=expected
+def render_result(summary: str, steps: str, actual: str, expected: str,
+                  freq: str, device_scope: str):
+    priority, is_scoped, scope_type, scope_detail, reason, adjusted_note = decide_priority(
+        "",
+        expected_result=expected,
+        summary=summary,
+        steps=steps,
+        reproduce_frequency=freq,
+        device_scope=device_scope,
     )
-    meta = PRIORITY_META[priority]
-    hits = find_hit_keywords(base_text + " " + actual + " " + expected, priority)
+    meta  = PRIORITY_META[priority]
+    fmeta = FREQ_META.get(freq, FREQ_META["always"])
+    hits  = find_hit_keywords(
+        (summary + " " + steps + " " + actual + " " + expected).lower(), priority
+    )
 
-    # Result card
+    # ── Result card ──────────────────────────────────────────
+    scope_html = ""
+    if is_scoped:
+        sc = SCOPE_META.get(scope_type, SCOPE_META["manual"])
+        scope_html = f"""
+        <div class="device-badge" style="
+            background:{sc['color']}22;
+            border:1px solid {sc['color']}66;
+            color:{sc['color']};
+        ">
+            ⚠ {sc['label']}: {scope_detail}
+        </div>"""
+
+    freq_html = f"""
+    <div class="freq-badge" style="
+        background:{fmeta['color']}22;
+        border:1px solid {fmeta['color']}55;
+        color:{fmeta['color']};
+    ">
+        {fmeta['icon']} {fmeta['label']}
+    </div>"""
+
     st.markdown(f"""
     <div class="result-card" style="background:{meta['bg']};border-color:{meta['border']};">
         <div class="result-priority-label" style="color:{meta['color']}">STP PRIORITY</div>
         <div class="result-priority-value" style="color:{meta['color']}">{meta['icon']} {meta['label']}</div>
         <div class="result-desc" style="color:{meta['color']}">{meta['desc']}</div>
-        {"" if not is_scoped else f'''
-        <div class="device-badge" style="
-            background:{SCOPE_META.get(scope_type,{}).get('color','#FF6F00')}22;
-            border:1px solid {SCOPE_META.get(scope_type,{}).get('color','#FF6F00')}66;
-            color:{SCOPE_META.get(scope_type,{}).get('color','#FF6F00')};
-        ">
-            ⚠ {SCOPE_META.get(scope_type,{}).get('label','Device Specific')}: {scope_detail}
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:0.5rem">
+            {freq_html}
+            {scope_html}
         </div>
-        '''}
     </div>
     """, unsafe_allow_html=True)
 
-    # Actual vs Expected comparison
+    # ── Adjustment note ──────────────────────────────────────
+    if adjusted_note.strip():
+        st.markdown(f"""
+        <div class="adjust-box" style="
+            background:#0D1B2A; border-color:#1E3A5F;
+        ">
+            <div class="adjust-box-label" style="color:#4FC3F7">Priority Adjustments Applied</div>
+            <div style="color:#A8C8E8">{adjusted_note}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── Actual vs Expected ───────────────────────────────────
     if actual.strip() or expected.strip():
-        actual_html = actual.strip() if actual.strip() else "<em style='opacity:0.4'>Not specified</em>"
-        expected_html = expected.strip() if expected.strip() else "<em style='opacity:0.4'>Not specified</em>"
+        actual_html   = actual.strip()   or "<em style='opacity:0.4'>Not specified</em>"
+        expected_html = expected.strip() or "<em style='opacity:0.4'>Not specified</em>"
         st.markdown(f"""
         <div class="result-comparison">
             <div class="result-box">
@@ -262,7 +340,7 @@ def render_result(summary: str, steps: str, actual: str, expected: str):
         </div>
         """, unsafe_allow_html=True)
 
-    # Reason
+    # ── Reason ───────────────────────────────────────────────
     st.markdown(f"""
     <div class="reason-box">
         <div class="reason-title">Why this priority?</div>
@@ -270,7 +348,7 @@ def render_result(summary: str, steps: str, actual: str, expected: str):
     </div>
     """, unsafe_allow_html=True)
 
-    # Matched keywords
+    # ── Matched signals ──────────────────────────────────────
     if hits:
         chips = "".join(f'<span class="kw-chip">{kw}</span>' for kw in hits)
         st.markdown(f"""
@@ -280,7 +358,7 @@ def render_result(summary: str, steps: str, actual: str, expected: str):
         </div>
         """, unsafe_allow_html=True)
 
-    return priority, is_scoped, scope_type, scope_detail, reason
+    return priority, is_scoped, scope_type, scope_detail, reason, adjusted_note
 
 
 # ─────────────────────────────────────────────
@@ -299,14 +377,21 @@ def render_history():
 
     for i, entry in enumerate(reversed(st.session_state.history)):
         meta     = PRIORITY_META[entry["priority"]]
+        fm       = FREQ_META.get(entry.get("freq", "always"), FREQ_META["always"])
         dev_html = (
-            f'<span class="hist-device">⚠ {entry["scope_detail"]}</span>'
+            f'<span class="hist-device">📱 {entry["scope_detail"]}</span>'
             if entry["is_scoped"] else ""
+        )
+        freq_html = (
+            f'<span style="font-size:0.68rem;color:{fm["color"]};'
+            f'font-family:\'JetBrains Mono\',monospace">'
+            f'{fm["icon"]} {fm["label"]}</span>'
         )
         st.markdown(f"""
         <div class="hist-row">
             <span class="hist-key">#{len(st.session_state.history)-i}</span>
-            <span class="hist-summary">{entry['summary'][:70]}{'…' if len(entry['summary'])>70 else ''}</span>
+            <span class="hist-summary">{entry['summary'][:60]}{'…' if len(entry['summary'])>60 else ''}</span>
+            {freq_html}
             {dev_html}
             <span class="hist-badge" style="background:{meta['color']}">{meta['label']}</span>
         </div>
@@ -315,18 +400,22 @@ def render_history():
     if len(st.session_state.history) > 0:
         hist_df = pd.DataFrame(st.session_state.history)[[
             "summary", "steps", "actual", "expected",
-            "priority", "is_scoped", "scope_type", "scope_detail", "reason"
+            "freq", "device_scope",
+            "priority", "is_scoped", "scope_type", "scope_detail",
+            "reason", "adjusted_note"
         ]]
         hist_df.columns = [
             "Summary", "Steps", "Actual Result", "Expected Result",
-            "Priority", "Device Specific", "Scope Type", "Scope Detail", "Reason"
+            "Reproduce Frequency", "Device/OS Scope",
+            "Priority", "Device Specific", "Scope Type", "Scope Detail",
+            "Reason", "Adjustments Applied"
         ]
         st.download_button(
             "⬇ Export session as CSV",
             data=hist_df.to_csv(index=False).encode("utf-8"),
             file_name="stp_session.csv",
             mime="text/csv",
-            key="dl_hist",
+            key=f"dl_hist_{len(st.session_state.history)}",
         )
 
 
@@ -364,7 +453,7 @@ def main():
             "Summary",
             placeholder="e.g. App crashes while sending voice message (Redmi 10)",
             label_visibility="collapsed",
-            key="inp_summary",
+            key="stp_summary_v2",
         )
 
         st.markdown('<div class="section-label">Steps to Reproduce</div>', unsafe_allow_html=True)
@@ -373,7 +462,7 @@ def main():
             placeholder="1. Open chat\n2. Tap voice message icon\n3. Record and send\n4. App force closes",
             height=110,
             label_visibility="collapsed",
-            key="inp_steps",
+            key="stp_steps_v2",
         )
 
         # Actual / Expected Result — side by side
@@ -383,22 +472,58 @@ def main():
             actual = st.text_area(
                 "Actual",
                 placeholder="What happens?\ne.g. App force closes immediately",
-                height=100,
+                height=90,
                 label_visibility="collapsed",
-                key="inp_actual",
+                key="stp_actual_v2",
             )
         with col_e:
             st.markdown('<div class="section-label">🟢 Expected Result</div>', unsafe_allow_html=True)
             expected = st.text_area(
                 "Expected",
                 placeholder="What should happen?\ne.g. Voice message sent successfully",
-                height=100,
+                height=90,
                 label_visibility="collapsed",
-                key="inp_expected",
+                key="stp_expected_v2",
+            )
+
+        # Reproduce Frequency + Device Scope — side by side
+        col_f, col_d = st.columns(2)
+        with col_f:
+            st.markdown('<div class="section-label">🔁 Reproduce Frequency</div>', unsafe_allow_html=True)
+            freq_labels = {
+                "always":       "🔁 Always",
+                "frequently":   "🔄 Frequently",
+                "occasionally": "🔃 Occasionally",
+                "rarely":       "🔀 Rarely",
+                "once":         "1️⃣ Once",
+            }
+            freq_display = list(freq_labels.values())
+            freq_keys    = list(freq_labels.keys())
+            selected_display = st.selectbox(
+                "Frequency",
+                options=freq_display,
+                index=0,
+                label_visibility="collapsed",
+                key="stp_freq_v2",
+            )
+            freq = freq_keys[freq_display.index(selected_display)]
+
+        with col_d:
+            st.markdown('<div class="section-label">📱 Device / OS Scope</div>', unsafe_allow_html=True)
+            device_scope = st.text_input(
+                "Device Scope",
+                placeholder="e.g. Samsung A5, iOS 16, Redmi 10…",
+                label_visibility="collapsed",
+                key="stp_device_v2",
+            )
+            st.markdown(
+                '<div style="font-size:0.7rem;color:#3A4A6B;margin-top:3px">'
+                'Leave empty if reproducible on all devices</div>',
+                unsafe_allow_html=True,
             )
 
         st.markdown("<br>", unsafe_allow_html=True)
-        analyze = st.button("▶  Analyze Priority", key="btn_analyze")
+        analyze = st.button("▶  Analyze Priority", key="stp_analyze_v2")
 
         # Priority legend
         st.markdown("<br>", unsafe_allow_html=True)
@@ -437,19 +562,22 @@ def main():
             if not summary.strip():
                 st.warning("Please enter at least a summary.")
             else:
-                priority, is_scoped, scope_type, scope_detail, reason = render_result(
-                    summary, steps, actual, expected
+                priority, is_scoped, scope_type, scope_detail, reason, adjusted_note = render_result(
+                    summary, steps, actual, expected, freq, device_scope
                 )
                 st.session_state.history.append({
-                    "summary":      summary,
-                    "steps":        steps,
-                    "actual":       actual,
-                    "expected":     expected,
-                    "priority":     priority,
-                    "is_scoped":    is_scoped,
-                    "scope_type":   scope_type,
-                    "scope_detail": scope_detail,
-                    "reason":       reason,
+                    "summary":       summary,
+                    "steps":         steps,
+                    "actual":        actual,
+                    "expected":      expected,
+                    "freq":          freq,
+                    "device_scope":  device_scope,
+                    "priority":      priority,
+                    "is_scoped":     is_scoped,
+                    "scope_type":    scope_type,
+                    "scope_detail":  scope_detail,
+                    "reason":        reason,
+                    "adjusted_note": adjusted_note,
                 })
         else:
             st.markdown("""

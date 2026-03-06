@@ -599,19 +599,62 @@ def detect_device_os_scope(text: str) -> Tuple[bool, str, str]:
 # Public API
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# Reproduce frequency config
+# ═══════════════════════════════════════════════════════════════
+
+# How each frequency value interacts with the cascade:
+#   always     → keeps / raises priority (crash that's always → Gating)
+#   frequently → no change
+#   occasionally → lower 1 level if Gating, no change otherwise
+#   rarely     → lower 1 level
+#   once       → lower 2 levels (max)
+FREQ_OPTIONS = ["always", "frequently", "occasionally", "rarely", "once"]
+
+FREQ_DROPS = {
+    "always":       0,
+    "frequently":   0,
+    "occasionally": 1,   # Gating → High, High → Medium (not lower)
+    "rarely":       1,
+    "once":         2,
+}
+
+# Frequency labels shown in reason
+FREQ_LABELS = {
+    "always":       "Always reproducible",
+    "frequently":   "Frequently reproducible",
+    "occasionally": "Occasionally reproducible",
+    "rarely":       "Rarely reproducible",
+    "once":         "Reproduced once",
+}
+
+
 def decide_priority(
     text: str,
     actual_result: str = "",
     expected_result: str = "",
     summary: str = "",
     steps: str = "",
-) -> Tuple[str, bool, str, str, str]:
+    reproduce_frequency: str = "always",
+    device_scope: str = "",
+) -> Tuple[str, bool, str, str, str, str]:
     """
-    Main entry point. Accepts either:
-      - text (combined) + actual/expected  [legacy mode]
-      - summary + steps + expected_result  [preferred, field-aware]
+    Main entry point.
 
-    Returns (priority, is_scoped, scope_type, scope_detail, reason)
+    Params:
+      summary / steps / expected_result  — field-aware inputs (preferred)
+      reproduce_frequency                — one of FREQ_OPTIONS
+      device_scope                       — free text e.g. "Samsung A5", "iOS 16"
+
+    Returns (priority, is_scoped, scope_type, scope_detail, reason, adjusted_note)
+
+    Priority adjustment rules:
+      1. Reproduce frequency drops (occasionally/rarely/once → lower 1-2 levels)
+         BUT: Gating with always/frequently stays Gating regardless of device scope.
+      2. Device scope (specific device/OS entered manually) → lower 1 level
+         Applied AFTER frequency drop.
+      3. Final floor: never goes below Low.
+      4. Gating with "once" still won't go below Medium (critical bugs matter).
     """
     # Normalise inputs
     if summary or steps:
@@ -619,51 +662,107 @@ def decide_priority(
         _steps    = steps
         _expected = expected_result
     else:
-        # Legacy: split combined text heuristically
         _summary  = text
         _steps    = actual_result
         _expected = expected_result
 
     combined = (_summary + " " + _steps + " " + _expected).lower()
-    is_scoped, scope_type, scope_detail = detect_device_os_scope(combined)
 
-    # Extract features
+    # Auto-detect device/OS scope from text if not manually provided
+    auto_scoped, auto_scope_type, auto_scope_detail = detect_device_os_scope(combined)
+
+    # Manual device scope overrides auto-detect
+    manual_scoped = bool(device_scope.strip())
+    if manual_scoped:
+        is_scoped    = True
+        scope_type   = "manual"
+        scope_detail = device_scope.strip()
+    else:
+        is_scoped    = auto_scoped
+        scope_type   = auto_scope_type
+        scope_detail = auto_scope_detail
+
+    # Normalise frequency
+    freq = reproduce_frequency.lower().strip() if reproduce_frequency else "always"
+    if freq not in FREQ_OPTIONS:
+        freq = "always"
+
+    # ── Extract features ─────────────────────────────────────
     f = extract_features(_summary, _steps, _expected)
 
     # ── Cascade ──────────────────────────────────────────────
+    # Inject frequency hint into combined so crash qualifier logic works
+    if freq in ("occasionally", "rarely", "once"):
+        combined += " sometimes"   # makes crash intermittent in stage1
+
     is_gating, gating_reason = _stage1_is_gating(f, combined)
     if is_gating:
-        priority = "Gating"
-        reason   = REASON_MAP["Gating"] + " [" + gating_reason + "]"
+        base_priority = "Gating"
+        reason        = REASON_MAP["Gating"] + " [" + gating_reason + "]"
     else:
         is_high, high_reason = _stage2_is_high(f, combined)
         if is_high:
-            priority = "High"
-            reason   = REASON_MAP["High"] + " [" + high_reason + "]"
+            base_priority = "High"
+            reason        = REASON_MAP["High"] + " [" + high_reason + "]"
         else:
-            priority, stage3_reason = _stage3_medium_or_low(f)
-            reason = REASON_MAP[priority] + " [" + stage3_reason + "]"
+            base_priority, stage3_reason = _stage3_medium_or_low(f)
+            reason = REASON_MAP[base_priority] + " [" + stage3_reason + "]"
 
     # ── Feature area note ────────────────────────────────────
     area = f["feature_area"]
     reason += f" · Feature area: {area}"
 
-    # ── Device scope adjustment ──────────────────────────────
-    flagship_signals = ["iphone", "samsung galaxy s", "pixel", "flagship"]
-    is_flagship = any(s in combined for s in flagship_signals)
+    priority     = base_priority
+    adjusted_note = ""
 
-    if is_scoped and not is_flagship and scope_type in ("single_device_repro", "device"):
+    # ── Step 1: Reproduce frequency adjustment ───────────────
+    freq_drop = FREQ_DROPS.get(freq, 0)
+    freq_label = FREQ_LABELS.get(freq, freq)
+
+    if freq_drop > 0:
         idx = PRIORITY_ORDER.index(priority)
-        if idx < len(PRIORITY_ORDER) - 1:
-            priority = PRIORITY_ORDER[idx + 1]
-            reason += (
-                f" ⚠ Reproduced only on specific device ({scope_detail}) — "
-                f"priority lowered by one level. Escalate if confirmed on other devices."
+        new_idx = min(idx + freq_drop, len(PRIORITY_ORDER) - 1)
+
+        # Special guard: Gating bugs never drop below Medium
+        # (a "once" Gating crash is still at least Medium)
+        if base_priority == "Gating":
+            new_idx = min(new_idx, PRIORITY_ORDER.index("Medium"))
+
+        if new_idx != idx:
+            old_p    = priority
+            priority = PRIORITY_ORDER[new_idx]
+            adjusted_note += (
+                f"📉 Frequency: {freq_label} — "
+                f"dropped from {old_p} → {priority}. "
             )
-    elif is_scoped and scope_type == "os_version":
-        reason += (
-            f" ⚠ Seen only on OS version ({scope_detail}) — "
-            f"limited impact, but monitor if that OS has wide adoption."
+
+    # ── Step 2: Device/OS scope adjustment ───────────────────
+    if is_scoped:
+        # Flagship/wide-adoption devices don't get lowered
+        flagship_signals = ["iphone", "samsung galaxy s", "pixel", "flagship", "ipad"]
+        is_flagship = (
+            any(s in combined for s in flagship_signals) or
+            any(s in scope_detail.lower() for s in flagship_signals)
         )
 
-    return priority, is_scoped, scope_type, scope_detail, reason
+        if not is_flagship:
+            idx = PRIORITY_ORDER.index(priority)
+            if idx < len(PRIORITY_ORDER) - 1:
+                old_p    = priority
+                priority = PRIORITY_ORDER[idx + 1]
+                adjusted_note += (
+                    f"📱 Device scope: {scope_detail} — "
+                    f"dropped from {old_p} → {priority}. "
+                    f"Escalate if confirmed on other devices."
+                )
+        else:
+            adjusted_note += (
+                f"📱 Device scope: {scope_detail} — "
+                f"high-adoption device, priority kept at {priority}."
+            )
+
+    # ── Final: never below Low ───────────────────────────────
+    if PRIORITY_ORDER.index(priority) > PRIORITY_ORDER.index("Low"):
+        priority = "Low"
+
+    return priority, is_scoped, scope_type, scope_detail, reason, adjusted_note

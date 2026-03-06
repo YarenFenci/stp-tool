@@ -1,395 +1,577 @@
 """
 STP Engine — BiP QA priority assignment.
-Uses weighted signal scoring across categories instead of exact keyword matching.
-Prevents over-assigning Low when no specific keyword matches.
+
+Architecture: 3-stage cascade (mirrors the spec's decision tree):
+  Stage 1 → Is Gating?   (hard failure / core broken / crash)
+  Stage 2 → Is High?     (core business action, feature-level validation)
+  Stage 3 → Medium vs Low (UX/navigation vs edge/cosmetic)
+
+Feature groups (per spec):
+  A. Failure intensity   — has_crash, has_open_fail, has_send_fail, etc.
+  B. Core action         — has_send_action, has_receive_action, has_call_action, etc.
+  C. UX / navigation     — has_search, has_list, has_display, etc.
+  D. Repo/feature context — feature_area (chat/calls/channels/status/emoji/more)
+  E. Field-aware weight  — same token scores differently in Summary vs Steps vs Expected
 """
 
 import re
-from typing import Tuple, List
+from typing import Tuple, Dict
 
 PRIORITY_ORDER = ["Gating", "High", "Medium", "Low"]
 
-# ─────────────────────────────────────────────────────────────
-# WEIGHTED SIGNALS
-# (term, weight, bucket)  bucket: gating | high | medium | low
-# Scoring: sum weights per bucket → highest bucket wins
-# ─────────────────────────────────────────────────────────────
-SIGNALS = [
+# ═══════════════════════════════════════════════════════════════
+# A. FAILURE INTENSITY TERMS  (Stage 1 — Gating triggers)
+# ═══════════════════════════════════════════════════════════════
 
-    # ══════════════════════════════════════════
-    # GATING — Core function completely broken
-    # ══════════════════════════════════════════
-
-    # Messaging core
-    ("mesaj gönderilemiyor",        10, "gating"),
-    ("mesaj gönderme çalışmıyor",   10, "gating"),
-    ("mesaj atılamıyor",            10, "gating"),
-    ("mesaj gönderilemedi",         10, "gating"),
-    ("mesajlaşma çalışmıyor",       10, "gating"),
-    ("chat açılmıyor",              10, "gating"),
-    ("sohbet başlatılamıyor",       10, "gating"),
-    ("mesaj iletilmiyor",            9, "gating"),
-    ("message not sending",         10, "gating"),
-    ("message send fail",           10, "gating"),
-    ("cannot send message",         10, "gating"),
-    ("messaging not working",       10, "gating"),
-    ("chat not working",            10, "gating"),
-    ("messages not delivered",       9, "gating"),
-
-    # Calling core
-    ("arama yapılamıyor",           10, "gating"),
-    ("arama çalışmıyor",            10, "gating"),
-    ("arama başlatılamıyor",        10, "gating"),
-    ("sesli arama çalışmıyor",      10, "gating"),
-    ("görüntülü arama çalışmıyor",  10, "gating"),
-    ("call not working",            10, "gating"),
-    ("call fails",                  10, "gating"),
-    ("cannot start call",           10, "gating"),
-    ("voice call broken",           10, "gating"),
-    ("video call broken",           10, "gating"),
-    ("call drops",                   8, "gating"),
-    ("arama düşüyor",                8, "gating"),
-
-    # Login / auth
-    ("giriş yapılamıyor",           10, "gating"),
-    ("uygulamaya girilemiyor",      10, "gating"),
-    ("login olunmuyor",             10, "gating"),
-    ("oturum açılamıyor",           10, "gating"),
-    ("kayıt olunamıyor",            10, "gating"),
-    ("doğrulama yapılamıyor",       10, "gating"),
-    ("cannot login",                10, "gating"),
-    ("login fails",                 10, "gating"),
-    ("login fail",                  10, "gating"),
-    ("app won't open",              10, "gating"),
-    ("registration failed",         10, "gating"),
-    ("otp gelmiyor",                10, "gating"),
-    ("otp çalışmıyor",              10, "gating"),
-    ("verification failed",         10, "gating"),
-    ("sign in fails",               10, "gating"),
-
-    # Reproducible crash
-    ("her zaman crash",             10, "gating"),
-    ("her seferinde crash",         10, "gating"),
-    ("her açılışta crash",          10, "gating"),
-    ("always crashes",              10, "gating"),
-    ("consistently crashes",        10, "gating"),
-    ("crash on every",              10, "gating"),
-    ("reproducible crash",          10, "gating"),
-    ("app crashes on launch",       10, "gating"),
-    ("app crash on start",          10, "gating"),
-    ("force close",                 10, "gating"),
-    ("fatal error",                  9, "gating"),
-    ("anr",                          8, "gating"),
-
-    # Fraud / financial
-    ("fraud",                       10, "gating"),
-    ("maddi kayıp",                 10, "gating"),
-    ("ücretlendirme hatası",        10, "gating"),
-    ("faturalama hatası",           10, "gating"),
-    ("para çekildi",                10, "gating"),
-    ("ödeme hatası",                10, "gating"),
-    ("billing error",               10, "gating"),
-    ("unauthorized charge",         10, "gating"),
-    ("payment error",               10, "gating"),
-
-    # Data loss
-    ("kalıcı veri kaybı",          10, "gating"),
-    ("mesajlar silindi",            10, "gating"),
-    ("veri kaybı",                  10, "gating"),
-    ("permanent data loss",         10, "gating"),
-    ("messages lost",               10, "gating"),
-    ("data corruption",             10, "gating"),
-    ("data loss",                   10, "gating"),
-
-    # Core media send
-    ("resim gönderilemiyor",         9, "gating"),
-    ("video gönderilemiyor",         9, "gating"),
-    ("dosya gönderilemiyor",         9, "gating"),
-    ("medya gönderilemedi",          9, "gating"),
-    ("image send fail",              9, "gating"),
-    ("file send fail",               9, "gating"),
-    ("media upload fails",           9, "gating"),
-
-    # ══════════════════════════════════════════
-    # HIGH — Important feature broken / impaired
-    # ══════════════════════════════════════════
-
-    # Intermittent core crashes
-    ("bazen çalışmıyor",             7, "high"),
-    ("zaman zaman crash",            7, "high"),
-    ("arada crash",                  7, "high"),
-    ("occasional crash",             7, "high"),
-    ("intermittent crash",           7, "high"),
-    ("sometimes fails",              7, "high"),
-    ("sometimes crashes",            7, "high"),
-
-    # Notifications
-    ("bildirim gelmiyor",            8, "high"),
-    ("bildirimler gelmiyor",         8, "high"),
-    ("push notification çalışmıyor", 8, "high"),
-    ("bildirimler çalışmıyor",       8, "high"),
-    ("notification not working",     8, "high"),
-    ("push notification fail",       8, "high"),
-    ("notifications broken",         8, "high"),
-    ("no notifications",             7, "high"),
-
-    # Group features
-    ("grup mesajı gönderilemiyor",   8, "high"),
-    ("grup sohbeti açılmıyor",       8, "high"),
-    ("group message fail",           8, "high"),
-    ("group chat not working",       8, "high"),
-    ("group call not working",       8, "high"),
-    ("grup araması çalışmıyor",      8, "high"),
-
-    # Story / status
-    ("hikaye paylaşılamıyor",        7, "high"),
-    ("story paylaşılamıyor",         7, "high"),
-    ("story görüntülenemiyor",       7, "high"),
-    ("story not loading",            7, "high"),
-    ("story upload fail",            7, "high"),
-    ("stories not working",          7, "high"),
-    ("durum paylaşılamıyor",         7, "high"),
-
-    # Media viewing
-    ("resim açılmıyor",              8, "high"),
-    ("video oynatılamıyor",          8, "high"),
-    ("medya görüntülenemiyor",       8, "high"),
-    ("image not loading",            8, "high"),
-    ("video not playing",            8, "high"),
-    ("media not loading",            8, "high"),
-    ("photos not opening",           8, "high"),
-    ("fotoğraf açılmıyor",           8, "high"),
-
-    # Message sync / delivery
-    ("mesajlar senkronize olmuyor",  7, "high"),
-    ("mesajlar geç geliyor",         7, "high"),
-    ("message sync fail",            7, "high"),
-    ("messages not syncing",         7, "high"),
-    ("messages delayed",             6, "high"),
-    ("mesajlar gecikiyor",           6, "high"),
-
-    # Contact / profile actions
-    ("kişi eklenemiyor",             7, "high"),
-    ("profil güncellenemiyor",       7, "high"),
-    ("ayarlar kaydedilemiyor",       7, "high"),
-    ("contact cannot be added",      7, "high"),
-    ("profile update fail",          7, "high"),
-    ("settings not saving",          7, "high"),
-    ("cannot block user",            7, "high"),
-    ("kullanıcı engellenemiyor",     7, "high"),
-
-    # Sticker / reactions
-    ("sticker gönderilemiyor",       6, "high"),
-    ("sticker çalışmıyor",           6, "high"),
-    ("emoji gönderilemiyor",         6, "high"),
-    ("reactions not working",        6, "high"),
-    ("tepki eklenemiyor",            6, "high"),
-
-    # Audio / video quality in call
-    ("ses gelmiyor",                 8, "high"),
-    ("mikrofon çalışmıyor",          8, "high"),
-    ("kamera çalışmıyor",            8, "high"),
-    ("no audio",                     8, "high"),
-    ("microphone not working",       8, "high"),
-    ("camera not working",           8, "high"),
-    ("black screen call",            8, "high"),
-    ("görüntü gelmiyor",             8, "high"),
-
-    # Search broken
-    ("arama sonuçları gelmiyor",     7, "high"),
-    ("kişi araması çalışmıyor",      7, "high"),
-    ("search not working",           7, "high"),
-    ("search returns nothing",       7, "high"),
-
-    # Flagship device crash
-    ("samsung crash",                7, "high"),
-    ("iphone crash",                 7, "high"),
-    ("flagship crash",               7, "high"),
-
-    # ══════════════════════════════════════════
-    # MEDIUM — Secondary UX issue, workaround exists
-    # ══════════════════════════════════════════
-
-    # UI functional errors
-    ("yanlış görüntüleniyor",        5, "medium"),
-    ("hatalı gösteriliyor",          5, "medium"),
-    ("arayüz bozuk",                 5, "medium"),
-    ("layout bozuk",                 5, "medium"),
-    ("ekran bozuk",                  5, "medium"),
-    ("incorrect display",            5, "medium"),
-    ("wrong layout",                 5, "medium"),
-    ("ui broken",                    5, "medium"),
-    ("interface broken",             5, "medium"),
-    ("screen glitch",                5, "medium"),
-    ("görsel bozukluk",              5, "medium"),
-    ("ui hatası",                    5, "medium"),
-    ("ui error",                     5, "medium"),
-
-    # Freeze / hang (not crash)
-    ("donuyor",                      5, "medium"),
-    ("takılıyor",                    5, "medium"),
-    ("yanıt vermiyor",               5, "medium"),
-    ("askıda kalıyor",               5, "medium"),
-    ("freeze",                       5, "medium"),
-    ("hangs",                        5, "medium"),
-    ("stuck",                        5, "medium"),
-    ("not responding",               5, "medium"),
-    ("app freezes",                  5, "medium"),
-
-    # Localization
-    ("çeviri hatası",                4, "medium"),
-    ("yanlış çeviri",                4, "medium"),
-    ("dil sorunu",                   4, "medium"),
-    ("lokalizasyon",                 4, "medium"),
-    ("translation error",            4, "medium"),
-    ("localization issue",           4, "medium"),
-    ("wrong language",               4, "medium"),
-    ("yanlış dil",                   4, "medium"),
-
-    # Contact / search partial
-    ("arama sonuçları yanlış",       5, "medium"),
-    ("kişi bulunamıyor",             5, "medium"),
-    ("contact search issue",         5, "medium"),
-    ("search results wrong",         5, "medium"),
-    ("yanlış sonuç",                 4, "medium"),
-
-    # Read receipt / delivery
-    ("okundu bilgisi gelmiyor",      4, "medium"),
-    ("iletildi göstermiyor",         4, "medium"),
-    ("read receipt missing",         4, "medium"),
-    ("delivery status wrong",        4, "medium"),
-    ("çift tık gelmiyor",            4, "medium"),
-
-    # Rare / random crash
-    ("nadir crash",                  5, "medium"),
-    ("rare crash",                   5, "medium"),
-    ("random crash",                 5, "medium"),
-    ("ara sıra crash",               5, "medium"),
-    ("crashes sometimes",            5, "medium"),
-
-    # Performance
-    ("yavaş yükleniyor",             4, "medium"),
-    ("geç açılıyor",                 4, "medium"),
-    ("gecikme var",                  4, "medium"),
-    ("yavaş açılıyor",               4, "medium"),
-    ("slow loading",                 4, "medium"),
-    ("performance issue",            4, "medium"),
-    ("lag",                          4, "medium"),
-    ("geç yükleniyor",               4, "medium"),
-    ("takes too long",               4, "medium"),
-    ("uzun sürüyor",                 4, "medium"),
-
-    # Settings minor
-    ("ses ayarı çalışmıyor",         4, "medium"),
-    ("titreşim çalışmıyor",          4, "medium"),
-    ("tema değişmiyor",              4, "medium"),
-    ("sound setting issue",          4, "medium"),
-    ("vibration not working",        4, "medium"),
-    ("dark mode not working",        4, "medium"),
-    ("karanlık mod çalışmıyor",      4, "medium"),
-    ("font size not changing",       4, "medium"),
-    ("yazı boyutu değişmiyor",       4, "medium"),
-
-    # Minor media
-    ("küçük resim görünmüyor",       4, "medium"),
-    ("thumbnail not showing",        4, "medium"),
-    ("önizleme gelmiyor",            4, "medium"),
-    ("preview not loading",          4, "medium"),
-
-    # Workaround available
-    ("workaround",                   3, "medium"),
-    ("alternative path",             3, "medium"),
-    ("farklı yoldan",                3, "medium"),
-
-    # Badge / counter wrong
-    ("bildirim sayısı yanlış",       4, "medium"),
-    ("okunmamış sayısı hatalı",      4, "medium"),
-    ("badge count wrong",            4, "medium"),
-    ("unread count wrong",           4, "medium"),
-
-    # ══════════════════════════════════════════
-    # LOW — Purely cosmetic, zero functional impact
-    # ══════════════════════════════════════════
-
-    ("yazım hatası",                 2, "low"),
-    ("typo",                         2, "low"),
-    ("spelling error",               2, "low"),
-    ("yanlış metin",                 2, "low"),
-    ("wrong text",                   2, "low"),
-    ("metin hatası",                 2, "low"),
-    ("hizalama bozuk",               2, "low"),
-    ("alignment issue",              2, "low"),
-    ("spacing sorunu",               2, "low"),
-    ("padding yanlış",               2, "low"),
-    ("wrong spacing",                2, "low"),
-    ("margin hatası",                2, "low"),
-    ("renk yanlış",                  2, "low"),
-    ("color wrong",                  2, "low"),
-    ("wrong color",                  2, "low"),
-    ("ikon yanlış",                  2, "low"),
-    ("wrong icon",                   2, "low"),
-    ("font sorunu",                  2, "low"),
-    ("wrong font",                   2, "low"),
-    ("font yanlış",                  2, "low"),
-    ("placeholder hatalı",           2, "low"),
-    ("wrong placeholder",            2, "low"),
-    ("tooltip yanlış",               2, "low"),
-    ("wrong tooltip",                2, "low"),
-    ("label yanlış",                 2, "low"),
-    ("wrong label",                  2, "low"),
-    ("animasyon bozuk",              2, "low"),
-    ("animation glitch",             2, "low"),
-    ("geçiş animasyonu",             2, "low"),
-    ("transition issue",             2, "low"),
-    ("blink",                        1, "low"),
-    ("gölge yanlış",                 1, "low"),
-    ("border hatalı",                1, "low"),
-    ("shadow wrong",                 1, "low"),
-    ("border issue",                 1, "low"),
-    ("eksik metin",                  2, "low"),
-    ("missing text",                 2, "low"),
-    ("boş alan görünüyor",           2, "low"),
-    ("empty space",                  1, "low"),
-    ("cosmetic",                     2, "low"),
-    ("kozmetik",                     2, "low"),
+# Hard failure: app/feature completely non-functional
+OPEN_FAIL_TERMS = [
+    "cannot open", "can't open", "cant open", "not open", "won't open",
+    "açılmıyor", "açılamıyor", "girilemiyor", "app not opening",
+    "unable to open", "fails to open", "doesn't open",
 ]
 
-# Export flat term lists for keyword highlighting in UI
-GATING_TERMS       = [s[0] for s in SIGNALS if s[2] == "gating"]
-HIGH_TERMS         = [s[0] for s in SIGNALS if s[2] == "high"]
-MEDIUM_TERMS       = [s[0] for s in SIGNALS if s[2] == "medium"]
-LOW_COSMETIC_TERMS = [s[0] for s in SIGNALS if s[2] == "low"]
-
-HARD_CRASH_TERMS = [
-    "crash", "force close", "çöküyor", "kapanıyor",
-    "uygulama kapandı", "app closed", "fatal error", "anr",
+SEND_FAIL_TERMS = [
+    "cannot send", "can't send", "cant send", "message not sent",
+    "failed to send", "send failed", "sending failed", "unable to send",
+    "gönderilemiyor", "gönderme başarısız", "gönderilemedi", "gönderme çalışmıyor",
+    "mesaj atılamıyor", "mesaj iletilmiyor",
 ]
-FREEZE_TERMS = [
-    "donuyor", "freeze", "takılıyor", "yanıt vermiyor",
-    "askıda kalıyor", "hangs", "stuck", "not responding",
+
+RECEIVE_FAIL_TERMS = [
+    "cannot receive", "can't receive", "not received", "not delivering",
+    "messages not delivered", "message not arriving", "unable to receive",
+    "alınamıyor", "gelmiyor", "iletilmiyor", "ulaşmıyor",
+]
+
+LOGIN_FAIL_TERMS = [
+    "cannot login", "can't login", "login fail", "login fails", "login failed",
+    "sign in fail", "cannot sign in", "unable to login", "authentication failed",
+    "verification failed", "otp gelmiyor", "otp çalışmıyor", "otp not received",
+    "giriş yapılamıyor", "giriş olunmuyor", "oturum açılamıyor",
+    "kayıt olunamıyor", "doğrulama başarısız",
+]
+
+CALL_FAIL_TERMS = [
+    "cannot call", "can't call", "call not started", "call fails", "call failed",
+    "cannot make call", "call not working", "call not connecting", "call not starting",
+    "not starting", "call won't start", "unable to call", "unable to start call",
+    "voice call broken", "video call broken", "call not initiated",
+    "arama yapılamıyor", "arama başlatılamıyor", "arama çalışmıyor",
+    "sesli arama çalışmıyor", "görüntülü arama çalışmıyor",
+    "arama başlatılamadı", "aramaya bağlanılamıyor",
+]
+
+STATUS_FAIL_TERMS = [
+    "cannot view status", "status not open", "cannot share status",
+    "cannot upload status", "status upload fail", "status not loading",
+    "durum paylaşılamıyor", "durum açılmıyor", "hikaye yüklenemiyor",
+    "story not uploading", "cannot post story", "story upload fail",
+]
+
+CHANNEL_FAIL_TERMS = [
+    "cannot open channel", "channel not open", "channel not loading",
+    "cannot access channel", "channel access broken",
+    "kanal açılmıyor", "kanala girilemiyor",
+]
+
+CRASH_TERMS = [
+    "crash", "crashes", "crashed", "force close", "app closed unexpectedly",
+    "fatal error", "anr", "not responding", "black screen",
+    "çöküyor", "çöktü", "kapanıyor", "uygulama kapandı",
+]
+
+FREEZE_STUCK_TERMS = [
+    "freeze", "frozen", "hang", "hangs", "hung", "stuck", "unresponsive",
+    "donuyor", "dondu", "takılıyor", "takıldı", "yanıt vermiyor",
+    "askıda", "ekran dondu",
+]
+
+LOAD_FAIL_TERMS = [
+    "cannot load", "fails to load", "loading failed", "not loading",
+    "load error", "yüklenemiyor", "yükleme başarısız",
+]
+
+FRAUD_TERMS = [
+    "fraud", "unauthorized charge", "billing error", "payment error",
+    "maddi kayıp", "ücretlendirme hatası", "faturalama hatası",
+    "para çekildi", "ödeme hatası", "yanlış fatura",
+]
+
+DATA_LOSS_TERMS = [
+    "data loss", "data corruption", "permanent data loss",
+    "messages lost", "messages deleted", "veri kaybı",
+    "kalıcı veri kaybı", "mesajlar silindi",
+]
+
+# ═══════════════════════════════════════════════════════════════
+# B. CORE BUSINESS ACTION TERMS  (Stage 2 — High triggers)
+# ═══════════════════════════════════════════════════════════════
+
+SEND_ACTION_TERMS = [
+    "send message", "sent message", "message sent", "message delivered",
+    "message received", "receive message", "received message",
+    "reply message", "forward message", "edit message", "delete message",
+    "seen", "delivered", "read receipt",
+    "mesaj gönder", "mesaj gönderilebiliyor", "mesaj alındı",
+]
+
+CALL_ACTION_TERMS = [
+    "voice call", "video call", "incoming call", "outgoing call",
+    "call connected", "call established", "call answered", "call ended",
+    "call initiated", "call received", "audio call", "group call",
+    "sesli arama", "görüntülü arama", "arama bağlandı", "arama kuruldu",
+    "arama cevaplandı", "arama sonlandı", "gelen arama", "giden arama",
+]
+
+STATUS_ACTION_TERMS = [
+    "share status", "upload status", "status uploaded", "status shared",
+    "view status", "status viewed", "delete status", "status deleted",
+    "add status", "status visible", "watch status",
+    "durum paylaş", "durum yükle", "durum görüntüle", "durum sil",
+]
+
+CHANNEL_ACTION_TERMS = [
+    "channel post", "post sent", "subscribe", "unsubscribe",
+    "join channel", "leave channel", "channel joined", "channel created",
+    "kanal gönder", "kanala katıl", "abone ol", "abonelikten çık",
+]
+
+REACTION_ACTION_TERMS = [
+    "reaction", "react", "emoji sent", "emoji send", "sticker sent",
+    "sticker send", "send emoji", "send sticker",
+    "tepki", "tepki ekle", "emoji gönder", "stiker gönder",
+]
+
+PROFILE_ACTION_TERMS = [
+    "profile updated", "settings saved", "password changed",
+    "privacy changed", "notification received", "push received",
+    "logout success", "login success",
+    "profil güncellendi", "ayarlar kaydedildi", "çıkış yapıldı",
+    "bildirim alındı",
+]
+
+NOTIFICATION_ACTION_TERMS = [
+    "notification received", "notification sent", "push notification",
+    "badge updated", "notification shown",
+    "bildirim geldi", "bildirim gönderildi", "push bildirim",
+]
+
+# ═══════════════════════════════════════════════════════════════
+# C. UX / NAVIGATION TERMS  (Stage 3 — Medium triggers)
+# ═══════════════════════════════════════════════════════════════
+
+SEARCH_TERMS = [
+    "search", "search bar", "search results", "search icon",
+    "arama", "arama çubuğu", "arama sonuçları",
+]
+
+LIST_DISPLAY_TERMS = [
+    "list", "listed", "display", "displayed", "shown", "shows", "view",
+    "scroll", "scrollable", "scrolled",
+    "liste", "listeleniyor", "görüntüleniyor", "gösteriliyor",
+]
+
+FILTER_TERMS = [
+    "filter", "filtered", "sort", "sorted", "category", "categories",
+    "filtre", "filtreleme", "sırala", "kategori",
+]
+
+NAVIGATION_TERMS = [
+    "navigate", "navigation", "tab", "icon", "panel", "open panel",
+    "menu", "settings", "open settings", "select", "picker", "keyboard",
+    "sekme", "ikon", "panel aç", "menü", "ayarlar aç", "seç",
+]
+
+HISTORY_LOG_TERMS = [
+    "history", "log", "timer", "duration", "timestamp",
+    "geçmiş", "kayıt", "süre", "zamanlayıcı", "zaman damgası",
+]
+
+PREVIEW_TERMS = [
+    "preview", "thumbnail", "preview shown", "thumbnail shown",
+    "önizleme", "küçük resim", "önizleme gösteriliyor",
+]
+
+PROFILE_DISPLAY_TERMS = [
+    "profile", "profile page", "profile view", "profile screen",
+    "profil", "profil sayfası", "profil görüntüle",
+]
+
+SETTINGS_DISPLAY_TERMS = [
+    "settings", "settings page", "settings screen", "open settings",
+    "ayarlar", "ayarlar sayfası", "ayarlar ekranı",
+]
+
+EMOJI_UI_TERMS = [
+    "picker", "emoji picker", "sticker picker", "recent", "favorites",
+    "skin tone", "scroll emoji", "category tab",
+    "seçici", "emoji seçici", "son kullanılan", "favoriler", "ten tonu",
+]
+
+# ═══════════════════════════════════════════════════════════════
+# D. LOW / COSMETIC TERMS  (Stage 3 — Low triggers)
+# ═══════════════════════════════════════════════════════════════
+
+COSMETIC_TERMS = [
+    "typo", "spelling", "alignment", "spacing", "padding", "margin",
+    "color", "colour", "font", "icon wrong", "wrong icon",
+    "wrong color", "wrong colour", "border", "shadow", "tooltip",
+    "placeholder", "label wrong", "wrong label", "animation",
+    "transition glitch", "blink",
+    "yazım hatası", "hizalama", "renk yanlış", "ikon yanlış",
+    "yanlış renk", "font sorunu", "gölge", "kenar", "animasyon bozuk",
+]
+
+# ═══════════════════════════════════════════════════════════════
+# For UI keyword highlighting export
+# ═══════════════════════════════════════════════════════════════
+GATING_TERMS = (
+    OPEN_FAIL_TERMS + SEND_FAIL_TERMS + RECEIVE_FAIL_TERMS +
+    LOGIN_FAIL_TERMS + CALL_FAIL_TERMS + STATUS_FAIL_TERMS +
+    CHANNEL_FAIL_TERMS + CRASH_TERMS + FREEZE_STUCK_TERMS +
+    LOAD_FAIL_TERMS + FRAUD_TERMS + DATA_LOSS_TERMS
+)
+HIGH_TERMS = (
+    SEND_ACTION_TERMS + CALL_ACTION_TERMS + STATUS_ACTION_TERMS +
+    CHANNEL_ACTION_TERMS + REACTION_ACTION_TERMS +
+    PROFILE_ACTION_TERMS + NOTIFICATION_ACTION_TERMS
+)
+MEDIUM_TERMS = (
+    SEARCH_TERMS + LIST_DISPLAY_TERMS + FILTER_TERMS +
+    NAVIGATION_TERMS + HISTORY_LOG_TERMS + PREVIEW_TERMS +
+    PROFILE_DISPLAY_TERMS + SETTINGS_DISPLAY_TERMS + EMOJI_UI_TERMS
+)
+LOW_COSMETIC_TERMS = COSMETIC_TERMS
+
+# Legacy compat
+HARD_CRASH_TERMS = CRASH_TERMS
+FREEZE_TERMS = FREEZE_STUCK_TERMS
+
+# ═══════════════════════════════════════════════════════════════
+# Device / OS scope detection
+# ═══════════════════════════════════════════════════════════════
+DEVICE_PATTERNS = [
+    r"\bredmi\s*\d+\b", r"\bxiaomi\b", r"\bsamsung\s+[a-z]\d+\b", r"\bhuawei\b",
+    r"\biphone\s*\d+\b", r"\bpixel\s*\d+\b", r"\boneplus\b", r"\boppo\b",
+    r"\brealme\b", r"\bvivo\b", r"\bnokia\b", r"\blg\b",
+    r"\bpoco\b", r"\bmoto\b", r"\bmotorola\b", r"\bgalaxy\s+[a-z]\d+\b",
+]
+OS_PATTERNS = [
+    r"\bandroid\s*\d+", r"\bios\s*\d+", r"\bmiui\s*\d+",
+    r"\bone\s*ui\s*\d+", r"\bharmonyos\b", r"\bcoloros\b",
+]
+CHIPSET_PATTERNS = [
+    r"\bsnapdragon\s*\d+", r"\bexynos\s*\d+", r"\bdimensity\s*\d+",
+    r"\bkirin\s*\d+", r"\ba\d+\s*chip\b", r"\bbionic\b",
+    r"\bmediatek\b", r"\bhelio\b",
 ]
 
 REASON_MAP = {
     "Gating": (
-        "This bug makes one of BiP's core functions (messaging, calling, login) completely unusable, "
-        "or contains a consistently reproducible crash. "
-        "Must be resolved before the release can ship."
+        "Core function is completely broken — app/feature unusable, "
+        "reproducible crash/freeze, or critical failure (fraud/data loss). "
+        "Must fix before release."
     ),
     "High": (
-        "An important feature is affected but the app is not entirely unusable. "
-        "The main flow is impaired — fix within 2 weeks. "
-        "PO and QA Lead must evaluate whether the release can ship as-is."
+        "Core business action is being validated (send/receive/call/share/subscribe). "
+        "Feature-level risk — important for release quality. "
+        "Fix within 2 weeks; PO/QA Lead to evaluate ship decision."
     ),
     "Medium": (
-        "A secondary function or UX issue. The user is impacted but a workaround exists "
-        "or this is not a high-frequency flow. Fix within 6 weeks."
+        "UX / navigation / data presentation scenario. "
+        "Feature works but secondary behaviour or discoverability is tested. "
+        "Fix within 6 weeks."
     ),
     "Low": (
-        "Purely cosmetic issue — typo, wrong color, alignment, or minor visual glitch. "
-        "No functional impact. Lowest priority."
+        "Edge case, rare condition, cosmetic issue, or low-frequency variant. "
+        "No meaningful business impact. Lowest priority."
     ),
 }
 
+
+# ═══════════════════════════════════════════════════════════════
+# Feature extraction
+# ═══════════════════════════════════════════════════════════════
+
+def _has(text: str, terms: list) -> bool:
+    return any(t in text for t in terms)
+
+def _count(text: str, terms: list) -> int:
+    return sum(1 for t in terms if t in text)
+
+def extract_features(summary: str, steps: str, expected: str) -> Dict:
+    """
+    Extract all feature groups from the three input fields.
+    Field-aware: same term weighted differently per field.
+    """
+    s  = summary.lower()
+    st = steps.lower()
+    ex = expected.lower()
+    combined = s + " " + st + " " + ex
+
+    # ── Failure intensity (A) ────────────────────────────────
+    feats = {
+        # Summary-weighted (strongest signal)
+        "sum_open_fail":    _has(s,  OPEN_FAIL_TERMS),
+        "sum_send_fail":    _has(s,  SEND_FAIL_TERMS),
+        "sum_receive_fail": _has(s,  RECEIVE_FAIL_TERMS),
+        "sum_login_fail":   _has(s,  LOGIN_FAIL_TERMS),
+        "sum_call_fail":    _has(s,  CALL_FAIL_TERMS),
+        "sum_status_fail":  _has(s,  STATUS_FAIL_TERMS),
+        "sum_channel_fail": _has(s,  CHANNEL_FAIL_TERMS),
+        "sum_crash":        _has(s,  CRASH_TERMS),
+        "sum_freeze":       _has(s,  FREEZE_STUCK_TERMS),
+        "sum_load_fail":    _has(s,  LOAD_FAIL_TERMS),
+        # Any field
+        "has_crash":        _has(combined, CRASH_TERMS),
+        "has_freeze":       _has(combined, FREEZE_STUCK_TERMS),
+        "has_open_fail":    _has(combined, OPEN_FAIL_TERMS),
+        "has_send_fail":    _has(combined, SEND_FAIL_TERMS),
+        "has_receive_fail": _has(combined, RECEIVE_FAIL_TERMS),
+        "has_login_fail":   _has(combined, LOGIN_FAIL_TERMS),
+        "has_call_fail":    _has(combined, CALL_FAIL_TERMS),
+        "has_status_fail":  _has(combined, STATUS_FAIL_TERMS),
+        "has_channel_fail": _has(combined, CHANNEL_FAIL_TERMS),
+        "has_load_fail":    _has(combined, LOAD_FAIL_TERMS),
+        "has_fraud":        _has(combined, FRAUD_TERMS),
+        "has_data_loss":    _has(combined, DATA_LOSS_TERMS),
+        # Failure count
+        "failure_term_count": (
+            _count(combined, CRASH_TERMS) +
+            _count(combined, FREEZE_STUCK_TERMS) +
+            _count(combined, OPEN_FAIL_TERMS) +
+            _count(combined, SEND_FAIL_TERMS) +
+            _count(combined, RECEIVE_FAIL_TERMS) +
+            _count(combined, LOGIN_FAIL_TERMS) +
+            _count(combined, CALL_FAIL_TERMS)
+        ),
+
+        # ── Core business action (B) ─────────────────────────
+        "has_send_action":         _has(combined, SEND_ACTION_TERMS),
+        "has_call_action":         _has(combined, CALL_ACTION_TERMS),
+        "has_status_action":       _has(combined, STATUS_ACTION_TERMS),
+        "has_channel_action":      _has(combined, CHANNEL_ACTION_TERMS),
+        "has_reaction_action":     _has(combined, REACTION_ACTION_TERMS),
+        "has_profile_action":      _has(combined, PROFILE_ACTION_TERMS),
+        "has_notification_action": _has(combined, NOTIFICATION_ACTION_TERMS),
+        "business_action_count": (
+            _count(combined, SEND_ACTION_TERMS) +
+            _count(combined, CALL_ACTION_TERMS) +
+            _count(combined, STATUS_ACTION_TERMS) +
+            _count(combined, CHANNEL_ACTION_TERMS) +
+            _count(combined, REACTION_ACTION_TERMS)
+        ),
+
+        # ── UX / navigation (C) ─────────────────────────────
+        "has_search":           _has(combined, SEARCH_TERMS),
+        "has_list_display":     _has(combined, LIST_DISPLAY_TERMS),
+        "has_filter":           _has(combined, FILTER_TERMS),
+        "has_navigation":       _has(combined, NAVIGATION_TERMS),
+        "has_history_log":      _has(combined, HISTORY_LOG_TERMS),
+        "has_preview":          _has(combined, PREVIEW_TERMS),
+        "has_profile_display":  _has(combined, PROFILE_DISPLAY_TERMS),
+        "has_settings_display": _has(combined, SETTINGS_DISPLAY_TERMS),
+        "has_emoji_ui":         _has(combined, EMOJI_UI_TERMS),
+        "ux_term_count": (
+            _count(combined, SEARCH_TERMS) +
+            _count(combined, LIST_DISPLAY_TERMS) +
+            _count(combined, FILTER_TERMS) +
+            _count(combined, NAVIGATION_TERMS) +
+            _count(combined, HISTORY_LOG_TERMS)
+        ),
+
+        # ── Cosmetic (D) ─────────────────────────────────────
+        "has_cosmetic": _has(combined, COSMETIC_TERMS),
+        "cosmetic_count": _count(combined, COSMETIC_TERMS),
+
+        # ── Field lengths ────────────────────────────────────
+        "summary_length":  len(s.split()),
+        "steps_length":    len(st.split()),
+        "expected_length": len(ex.split()),
+    }
+
+    # ── Feature area / repo context (D) ─────────────────────
+    # Infer from summary + steps keywords
+    area_signals = {
+        "chat":     ["chat", "message", "sohbet", "mesaj", "conversation", "inbox"],
+        "calls":    ["call", "voice", "video call", "arama", "sesli", "görüntülü"],
+        "channels": ["channel", "kanal", "post", "subscribe", "unsubscribe"],
+        "status":   ["status", "story", "durum", "hikaye"],
+        "emoji":    ["emoji", "sticker", "reaction", "picker", "tepki", "stiker"],
+        "more":     ["settings", "profile", "privacy", "password", "logout",
+                     "ayarlar", "profil", "gizlilik", "şifre", "çıkış"],
+    }
+    area_scores = {area: sum(1 for kw in kws if kw in combined)
+                   for area, kws in area_signals.items()}
+    best_area = max(area_scores, key=area_scores.get) if any(area_scores.values()) else "others"
+    feats["feature_area"] = best_area
+    for area in area_signals:
+        feats[f"repo_is_{area}"] = (best_area == area)
+
+    return feats
+
+
+# ═══════════════════════════════════════════════════════════════
+# Cascade decision engine
+# ═══════════════════════════════════════════════════════════════
+
+def _stage1_is_gating(f: Dict, combined: str) -> Tuple[bool, str]:
+    """
+    Stage 1: Is this Gating?
+    Hard failure: core function broken, crash, freeze, fraud, data loss.
+    Field-aware: summary-level failures are strongest.
+    """
+    # Strongest: failure term IN summary — but check intermittent first
+    intermit_combined = any(t in combined for t in [
+        "sometimes", "occasionally", "random", "rarely", "intermittent",
+        "bazen", "zaman zaman", "ara sıra", "nadir",
+        "sometimes crashes", "crashes sometimes",
+    ])
+
+    summary_critical = (
+        f["sum_open_fail"] or f["sum_send_fail"] or f["sum_receive_fail"] or
+        f["sum_login_fail"] or f["sum_call_fail"] or f["sum_status_fail"] or
+        f["sum_channel_fail"] or f["sum_load_fail"]
+    )
+    # Crash in summary — but not if qualified as intermittent
+    if f["sum_crash"] and not intermit_combined:
+        return True, "Crash signal in Summary — core function unusable."
+
+    if summary_critical:
+        return True, "Hard failure signal found in Summary — core function unusable."
+
+    # Crash anywhere
+    if f["has_crash"]:
+        # Check intermittent FIRST — intermittent crash → High, not Gating
+        intermit = any(t in combined for t in [
+            "sometimes", "occasionally", "random", "rarely", "intermittent",
+            "bazen", "zaman zaman", "ara sıra", "nadir", "sometimes crashes",
+            "crashes sometimes",
+        ])
+        if intermit:
+            return False, ""  # Let Stage 2 handle it as High
+        # Unqualified or reproducible crash → Gating
+        return True, "Reproducible or unqualified crash — Gating."
+
+    # Freeze/stuck anywhere → Gating (app unusable)
+    if f["has_freeze"]:
+        # But not if it's clearly intermittent
+        intermit = any(t in combined for t in [
+            "sometimes", "occasionally", "bazen", "zaman zaman", "ara sıra",
+        ])
+        if not intermit:
+            return True, "App/screen freeze or stuck — unusable state, always Gating."
+
+    # Fraud / data loss
+    if f["has_fraud"]:
+        return True, "Fraud / financial risk detected — always Gating."
+    if f["has_data_loss"]:
+        return True, "Permanent data loss detected — always Gating."
+
+    # High failure count even if no single pattern matched
+    if f["failure_term_count"] >= 3:
+        return True, "Multiple failure signals — core function likely broken."
+
+    # Failure in any field but high count
+    any_critical = (
+        f["has_open_fail"] or f["has_send_fail"] or f["has_receive_fail"] or
+        f["has_login_fail"] or f["has_call_fail"] or f["has_status_fail"] or
+        f["has_channel_fail"] or f["has_load_fail"]
+    )
+    if any_critical and f["failure_term_count"] >= 2:
+        return True, "Multiple failure signals across fields — blocking issue."
+
+    return False, ""
+
+
+def _stage2_is_high(f: Dict, combined: str) -> Tuple[bool, str]:
+    """
+    Stage 2: Is this High?
+    Core business action being validated — not a failure, but feature-critical.
+    """
+    # Intermittent crash → High (not Gating)
+    if f["has_crash"]:
+        intermit = any(t in combined for t in [
+            "sometimes", "occasionally", "random", "rarely", "intermittent",
+            "bazen", "zaman zaman", "ara sıra", "nadir",
+        ])
+        if intermit:
+            return True, "Intermittent crash — important but not always reproducible."
+
+    # Core business actions
+    has_core_action = (
+        f["has_send_action"] or f["has_call_action"] or f["has_status_action"] or
+        f["has_channel_action"] or f["has_reaction_action"] or
+        f["has_profile_action"] or f["has_notification_action"]
+    )
+    if has_core_action:
+        # Boost if multiple actions or important area
+        area = f["feature_area"]
+        if area in ("chat", "calls", "channels", "status"):
+            return True, f"Core business action in high-value feature area ({area})."
+        return True, "Core business action — feature-level validation."
+
+    # Any failure in steps/expected (not summary) → High if not Gating
+    if (f["has_send_fail"] or f["has_receive_fail"] or f["has_call_fail"]):
+        return True, "Failure term in steps/expected — important feature issue."
+
+    # High business action count
+    if f["business_action_count"] >= 2:
+        return True, "Multiple business action signals — feature-critical scenario."
+
+    return False, ""
+
+
+def _stage3_medium_or_low(f: Dict) -> Tuple[str, str]:
+    """
+    Stage 3: Medium vs Low.
+    Medium: UX / navigation / display / secondary interaction.
+    Low: edge case, cosmetic, rare condition, no UX impact.
+
+    Key rule: if cosmetic signals dominate (no real functional UX behaviour),
+    output Low. Navigation/display words that only appear as context for the
+    cosmetic ("icon wrong on tab bar") should NOT promote to Medium.
+    """
+    has_ux = (
+        f["has_search"] or f["has_filter"] or f["has_navigation"] or
+        f["has_history_log"] or f["has_preview"] or f["has_emoji_ui"]
+    )
+    # list_display alone is too generic (cosmetic descriptions use 'shown', 'displayed')
+    has_ux_strong = (
+        f["has_search"] or f["has_filter"] or f["has_history_log"] or
+        f["has_emoji_ui"] or f["ux_term_count"] >= 5
+    )
+
+    # Pure cosmetic only (typo / color / alignment / icon wrong) → Low
+    # "wrong icon on tab bar" — navigation word is context, not the bug itself
+    if f["has_cosmetic"] and f["cosmetic_count"] >= 1:
+        # Only override to Medium if strong independent UX behaviour present
+        # (search/filter/history are strong; tab/icon/navigation alone are not)
+        if not has_ux_strong:
+            return "Low", "Cosmetic issue (typo / alignment / color / icon). No functional impact."
+
+    # Strong UX signals → Medium
+    if has_ux_strong or f["ux_term_count"] >= 2:
+        return "Medium", "UX / navigation / data presentation scenario."
+
+    if has_ux:
+        return "Medium", "Secondary UX or navigation behaviour."
+
+    # Settings / profile display without cosmetic → Medium
+    if f["has_settings_display"] or f["has_profile_display"]:
+        if not f["has_cosmetic"]:
+            return "Medium", "Settings or profile display scenario."
+
+    # No signals → Medium (unknown, needs review — not Low)
+    return "Medium", (
+        "No strong signals. Defaulting to Medium — "
+        "likely a functional scenario that needs manual review."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scope detection
+# ═══════════════════════════════════════════════════════════════
 
 def detect_device_os_scope(text: str) -> Tuple[bool, str, str]:
     t = text.lower()
@@ -413,94 +595,58 @@ def detect_device_os_scope(text: str) -> Tuple[bool, str, str]:
     return False, "", ""
 
 
-DEVICE_PATTERNS = [
-    r"\bredmi\s*\d+\b", r"\bxiaomi\b", r"\bsamsung\s+[a-z]\d+", r"\bhuawei\b",
-    r"\biphone\s*\d+\b", r"\bpixel\s*\d+\b", r"\boneplus\b", r"\boppo\b",
-    r"\brealme\b", r"\bvivo\b", r"\bnokia\b", r"\blg\b",
-    r"\bpoco\b", r"\bmoto\b", r"\bmotorola\b", r"\bgalaxy\s+[a-z]\d+\b",
-]
-OS_PATTERNS = [
-    r"\bandroid\s*\d+", r"\bios\s*\d+", r"\bmiui\s*\d+",
-    r"\bone\s*ui\s*\d+", r"\bharmonyos\b", r"\bcoloros\b",
-]
-CHIPSET_PATTERNS = [
-    r"\bsnapdragon\s*\d+", r"\bexynos\s*\d+", r"\bdimensity\s*\d+",
-    r"\bkirin\s*\d+", r"\ba\d+\s*chip\b", r"\bbionic\b",
-    r"\bmediatek\b", r"\bhelio\b",
-]
-
-
-def _score(text: str) -> dict:
-    t = text.lower()
-    scores = {"gating": 0, "high": 0, "medium": 0, "low": 0}
-    for term, weight, bucket in SIGNALS:
-        if term in t:
-            scores[bucket] += weight
-    return scores
-
+# ═══════════════════════════════════════════════════════════════
+# Public API
+# ═══════════════════════════════════════════════════════════════
 
 def decide_priority(
     text: str,
     actual_result: str = "",
     expected_result: str = "",
+    summary: str = "",
+    steps: str = "",
 ) -> Tuple[str, bool, str, str, str]:
     """
+    Main entry point. Accepts either:
+      - text (combined) + actual/expected  [legacy mode]
+      - summary + steps + expected_result  [preferred, field-aware]
+
     Returns (priority, is_scoped, scope_type, scope_detail, reason)
-    Scoring: sum signal weights per bucket → highest bucket wins.
-    Default on zero signal → Medium (unknown, needs investigation).
     """
-    combined = (text + " " + actual_result + " " + expected_result).lower()
+    # Normalise inputs
+    if summary or steps:
+        _summary  = summary
+        _steps    = steps
+        _expected = expected_result
+    else:
+        # Legacy: split combined text heuristically
+        _summary  = text
+        _steps    = actual_result
+        _expected = expected_result
+
+    combined = (_summary + " " + _steps + " " + _expected).lower()
     is_scoped, scope_type, scope_detail = detect_device_os_scope(combined)
 
-    # ── Crash qualifier ──────────────────────────────────────
-    has_crash = any(term in combined for term in HARD_CRASH_TERMS)
-    reproducible_signals = [
-        "her zaman", "her seferinde", "always", "consistently",
-        "every time", "100%", "force close", "uygulama açılmıyor",
-        "app crash on start", "app crashes on launch",
-    ]
-    intermittent_signals = [
-        "bazen", "zaman zaman", "ara sıra", "nadir", "sometimes",
-        "occasionally", "random", "rarely", "intermittent",
-    ]
-    if has_crash:
-        is_repro = any(s in combined for s in reproducible_signals)
-        is_intermit = any(s in combined for s in intermittent_signals)
-        if is_repro:
-            combined += " reproducible crash always crashes"
-        elif is_intermit:
-            combined += " intermittent crash"
+    # Extract features
+    f = extract_features(_summary, _steps, _expected)
+
+    # ── Cascade ──────────────────────────────────────────────
+    is_gating, gating_reason = _stage1_is_gating(f, combined)
+    if is_gating:
+        priority = "Gating"
+        reason   = REASON_MAP["Gating"] + " [" + gating_reason + "]"
+    else:
+        is_high, high_reason = _stage2_is_high(f, combined)
+        if is_high:
+            priority = "High"
+            reason   = REASON_MAP["High"] + " [" + high_reason + "]"
         else:
-            combined += " reproducible crash always crashes"  # conservative
+            priority, stage3_reason = _stage3_medium_or_low(f)
+            reason = REASON_MAP[priority] + " [" + stage3_reason + "]"
 
-    # ── Score ────────────────────────────────────────────────
-    scores = _score(combined)
-    total_signal = sum(scores.values())
-
-    if total_signal == 0:
-        priority = "Medium"
-        reason = (
-            "No specific keyword signals matched. Defaulting to Medium — "
-            "the description suggests a functional problem worth investigating. "
-            "Please review and adjust manually if needed."
-        )
-        return priority, is_scoped, scope_type, scope_detail, reason
-
-    bucket_order = ["gating", "high", "medium", "low"]
-    best_bucket = max(bucket_order, key=lambda b: (scores[b], -bucket_order.index(b)))
-
-    # Pure cosmetic → stay Low. Only bump if mixed with functional signals.
-    if best_bucket == "low" and (scores["gating"] + scores["high"] + scores["medium"]) > 0:
-        best_bucket = max(["gating", "high", "medium"],
-                          key=lambda b: (scores[b], -["gating","high","medium"].index(b)))
-
-    priority_map = {"gating": "Gating", "high": "High", "medium": "Medium", "low": "Low"}
-    priority = priority_map[best_bucket]
-    reason = REASON_MAP[priority]
-
-    sig_parts = [f"{b.capitalize()}: {scores[b]}" for b in bucket_order if scores[b] > 0]
-    if sig_parts:
-        reason += f" [Scores — {' · '.join(sig_parts)}]"
+    # ── Feature area note ────────────────────────────────────
+    area = f["feature_area"]
+    reason += f" · Feature area: {area}"
 
     # ── Device scope adjustment ──────────────────────────────
     flagship_signals = ["iphone", "samsung galaxy s", "pixel", "flagship"]

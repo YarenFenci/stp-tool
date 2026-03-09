@@ -284,42 +284,16 @@ def render_result(summary: str, steps: str, actual: str, expected: str,
         device_scope=device_scope,
     )
     meta  = PRIORITY_META[priority]
-    fmeta = FREQ_META.get(freq, FREQ_META["always"])
     hits  = find_hit_keywords(
         (summary + " " + steps + " " + actual + " " + expected).lower(), priority
     )
 
     # ── Result card ──────────────────────────────────────────
-    scope_html = ""
-    if is_scoped:
-        sc = SCOPE_META.get(scope_type, SCOPE_META["manual"])
-        scope_html = f"""
-        <div class="device-badge" style="
-            background:{sc['color']}22;
-            border:1px solid {sc['color']}66;
-            color:{sc['color']};
-        ">
-            ⚠ {sc['label']}: {scope_detail}
-        </div>"""
-
-    freq_html = f"""
-    <div class="freq-badge" style="
-        background:{fmeta['color']}22;
-        border:1px solid {fmeta['color']}55;
-        color:{fmeta['color']};
-    ">
-        {fmeta['icon']} {fmeta['label']}
-    </div>"""
-
     st.markdown(f"""
     <div class="result-card" style="background:{meta['bg']};border-color:{meta['border']};">
         <div class="result-priority-label" style="color:{meta['color']}">STP PRIORITY</div>
         <div class="result-priority-value" style="color:{meta['color']}">{meta['icon']} {meta['label']}</div>
         <div class="result-desc" style="color:{meta['color']}">{meta['desc']}</div>
-        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:0.5rem">
-            {freq_html}
-            {scope_html}
-        </div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -632,4 +606,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

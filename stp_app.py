@@ -22,6 +22,17 @@ from stp_engine import (
     FREQ_OPTIONS,
 )
 
+
+def auto_detect_device(text: str) -> str:
+    """
+    Run detect_device_os_scope on the given text and return
+    a human-readable device/OS string if found, else empty string.
+    """
+    _, scope_type, scope_detail = detect_device_os_scope(text)
+    if scope_detail:
+        return scope_detail
+    return ""
+
 # ─────────────────────────────────────────────
 # Priority metadata
 # ─────────────────────────────────────────────
@@ -510,17 +521,40 @@ def main():
 
         with col_d:
             st.markdown('<div class="section-label">📱 Device / OS Scope</div>', unsafe_allow_html=True)
+
+            # Auto-detect from what's already typed in summary + steps
+            live_text = (
+                st.session_state.get("stp_summary_v2", "") + " " +
+                st.session_state.get("stp_steps_v2", "")
+            )
+            auto_detected = auto_detect_device(live_text)
+
             device_scope = st.text_input(
                 "Device Scope",
+                value=auto_detected,
                 placeholder="e.g. Samsung A5, iOS 16, Redmi 10…",
                 label_visibility="collapsed",
                 key="stp_device_v2",
             )
-            st.markdown(
-                '<div style="font-size:0.7rem;color:#3A4A6B;margin-top:3px">'
-                'Leave empty if reproducible on all devices</div>',
-                unsafe_allow_html=True,
-            )
+
+            if auto_detected and auto_detected.lower() == device_scope.strip().lower():
+                st.markdown(
+                    f'<div style="font-size:0.7rem;color:#FF9800;margin-top:3px">'
+                    f'⚡ Auto-detected from scenario — edit if needed</div>',
+                    unsafe_allow_html=True,
+                )
+            elif device_scope.strip():
+                st.markdown(
+                    '<div style="font-size:0.7rem;color:#43A047;margin-top:3px">'
+                    '✏️ Manually set — priority will be adjusted</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div style="font-size:0.7rem;color:#3A4A6B;margin-top:3px">'
+                    'Leave empty = reproducible on all devices</div>',
+                    unsafe_allow_html=True,
+                )
 
         st.markdown("<br>", unsafe_allow_html=True)
         analyze = st.button("▶  Analyze Priority", key="stp_analyze_v2")
@@ -598,6 +632,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
     
